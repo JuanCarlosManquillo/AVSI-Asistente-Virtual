@@ -1,0 +1,3349 @@
+{
+  "name": "0 · Herramientas (sub-workflow)",
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "accion"
+            },
+            {
+              "name": "telefono"
+            },
+            {
+              "name": "whatsapp_jid"
+            },
+            {
+              "name": "nombre_perfil"
+            },
+            {
+              "name": "nombre"
+            },
+            {
+              "name": "codigo"
+            },
+            {
+              "name": "programa"
+            },
+            {
+              "name": "servicio"
+            },
+            {
+              "name": "disponibilidad"
+            },
+            {
+              "name": "id_solicitud"
+            },
+            {
+              "name": "motivo"
+            },
+            {
+              "name": "ultimo_mensaje"
+            },
+            {
+              "name": "fecha_desde"
+            },
+            {
+              "name": "franja"
+            },
+            {
+              "name": "fecha_solicitada"
+            },
+            {
+              "name": "hora_solicitada"
+            },
+            {
+              "name": "profesional_solicitado"
+            },
+            {
+              "name": "tipo_documento"
+            },
+            {
+              "name": "numero_documento"
+            },
+            {
+              "name": "correo"
+            },
+            {
+              "name": "telefono_contacto"
+            },
+            {
+              "name": "profesional"
+            },
+            {
+              "name": "tipo_atencion"
+            },
+            {
+              "name": "message_id"
+            },
+            {
+              "name": "mimetype"
+            },
+            {
+              "name": "edad"
+            },
+            {
+              "name": "facultad"
+            }
+          ]
+        }
+      },
+      "id": "7b8ae017-a7b1-457f-a7bf-c7cfb23149cf",
+      "name": "Entrada herramienta",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -1040,
+        -112
+      ],
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 6,
+        "output": "={{ ({registrar:0, cancelar:1, escalar:2, horarios:3, verificar:3, comprobante:4, mis_solicitudes:5})[$json.accion] ?? 2 }}"
+      },
+      "id": "f3a4a979-f627-4b17-b929-165274069d07",
+      "name": "¿Qué herramienta?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -368,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// v5: también pide edad y facultad (se escriben en la agenda del profesional al confirmar).\n// v4 (US-9): recupera datos de la pestaña Borradores y entrega el borrador para guardarlo.\n// Prepara y VALIDA la solicitud antes de avisar a la encargada y guardarla (US-1, US-2 y US-6).\n// El teléfono y el JID vienen fijos del flujo principal (no del modelo): nadie registra a nombre de otro número.\n// Si algo falta o no es válido, responde ok:false con la lista exacta, para que el agente pida SOLO eso\n// y conserve lo demás (FR15).\nconst entrada = $('Entrada herramienta').first().json;\n// US-9-AC-4 / FR15: si un intento anterior falló, se recuperan los datos guardados en la pestaña\n// Borradores (máximo 48 horas). Lo que el estudiante acaba de dar siempre tiene prioridad.\nconst CAMPOS = ['nombre', 'codigo', 'tipo_documento', 'numero_documento', 'edad', 'programa', 'facultad', 'correo', 'telefono_contacto',\n  'servicio', 'tipo_atencion', 'disponibilidad', 'fecha_solicitada', 'hora_solicitada', 'profesional_solicitado'];\nlet previo = {};\ntry {\n  const b = $('Leer borrador').first().json;\n  const guardado = DateTime.fromFormat(String(b.actualizado ?? ''), 'yyyy-MM-dd HH:mm', { zone: 'America/Bogota' });\n  if (b.datos && guardado.isValid && $now.diff(guardado, 'hours').hours <= 48) previo = JSON.parse(b.datos);\n} catch (e) { previo = {}; }\nconst i = { ...entrada };\nfor (const k of CAMPOS) if (!String(entrada[k] ?? '').trim() && String(previo[k] ?? '').trim()) i[k] = previo[k];\nconst borradorObj = {};\nfor (const k of CAMPOS) if (String(i[k] ?? '').trim()) borradorObj[k] = String(i[k]).trim();\nconst borrador = JSON.stringify(borradorObj);\nconst ZONA = 'America/Bogota';\nconst hoy = $now.setZone(ZONA).startOf('day');\nconst limpio = v => String(v ?? '').trim().replace(/\\s+/g, ' ');\nconst sinTildes = s => limpio(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();\n\n// Servicios habilitados (US-2-AC-1). Deben coincidir con los del prompt y con las carpetas de Drive.\nconst SERVICIOS = { psicologia: 'psicología', medicina: 'medicina', odontologia: 'odontología' };\n// Tipos de documento aceptados (pendiente de confirmar con Erika: decisión D4).\nconst TIPOS = [\n  { tipo: 'CC',  claves: ['cc', 'cedula de ciudadania', 'cedula'],            patron: /^\\d{6,10}$/,       ayuda: 'de 6 a 10 dígitos' },\n  { tipo: 'TI',  claves: ['ti', 'tarjeta de identidad', 'tarjeta'],           patron: /^\\d{10,11}$/,      ayuda: 'de 10 u 11 dígitos' },\n  { tipo: 'CE',  claves: ['ce', 'cedula de extranjeria', 'extranjeria'],      patron: /^[a-z0-9]{5,12}$/i, ayuda: 'de 5 a 12 letras o números' },\n  { tipo: 'PPT', claves: ['ppt', 'permiso por proteccion temporal', 'permiso'], patron: /^\\d{6,10}$/,     ayuda: 'de 6 a 10 dígitos' },\n  { tipo: 'PA',  claves: ['pa', 'pasaporte'],                                  patron: /^[a-z0-9]{5,12}$/i, ayuda: 'de 5 a 12 letras o números' },\n];\n\nconst problemas = [];\nconst nombre = limpio(i.nombre);\nif (nombre.split(' ').filter(p => /\\p{L}{2,}/u.test(p)).length < 2) problemas.push('nombre completo (nombre y apellido)');\n\nconst codigo = limpio(i.codigo).replace(/[\\s.-]/g, '');\nif (!/^\\d{6,15}$/.test(codigo)) problemas.push('código estudiantil (solo números, de 6 a 15 dígitos)');\n\nconst tipoTxt = sinTildes(i.tipo_documento).replace(/\\./g, '');\nconst tipo = TIPOS.find(t => t.claves.some(k => tipoTxt === k || tipoTxt.startsWith(k + ' ')));\nif (!tipo) problemas.push('tipo de documento (CC, TI, CE, PPT o pasaporte)');\n\nconst numero = limpio(i.numero_documento).replace(/[\\s.-]/g, '');\nif (!numero) problemas.push('número de documento');\nelse if (tipo && !tipo.patron.test(numero)) problemas.push(`número de documento (para ${tipo.tipo} debe tener ${tipo.ayuda})`);\n// US-1-AC-3: el código y el documento son datos distintos; uno no reemplaza al otro.\nif (numero && codigo && numero === codigo) problemas.push('número de documento (es igual al código estudiantil: se necesitan los dos por separado)');\n\nconst edadTxt = limpio(i.edad).replace(/\\D/g, '');\nconst edad = Number(edadTxt);\nif (!edadTxt || edad < 14 || edad > 90) problemas.push('edad (en años, solo el número)');\n\nconst programa = limpio(i.programa);\nif (programa.length < 3) problemas.push('programa académico');\n\nconst facultad = limpio(i.facultad);\nif (facultad.length < 3) problemas.push('facultad');\n\nconst correo = limpio(i.correo).toLowerCase();\nif (!/^[^\\s@]+@[^\\s@]+\\.[a-z]{2,}$/.test(correo)) problemas.push('correo electrónico (ej. nombre@unicauca.edu.co)');\n\nconst servicioClave = Object.keys(SERVICIOS).find(k => sinTildes(i.servicio).includes(k));\nif (!servicioClave) problemas.push('servicio (psicología, medicina u odontología)');\n\n// US-6: tipo de atención, necesario para saber si la cita tiene costo.\nconst TIPOS_ATENCION = { primera: 'primera_vez', seguimiento: 'seguimiento', control: 'control' };\nconst tipoAtencionTxt = sinTildes(i.tipo_atencion);\nconst tipoAtencion = Object.entries(TIPOS_ATENCION).find(([k]) => tipoAtencionTxt.includes(k))?.[1];\nif (!tipoAtencion) problemas.push('tipo de atención (primera vez, seguimiento o control)');\n\n// Teléfono de contacto: opcional. Si no lo dan, se usa el mismo WhatsApp.\nlet telefonoContacto = limpio(i.telefono_contacto).replace(/\\D/g, '');\nif (telefonoContacto) {\n  if (/^3\\d{9}$/.test(telefonoContacto)) telefonoContacto = '57' + telefonoContacto;\n  if (!/^573\\d{9}$/.test(telefonoContacto)) problemas.push('teléfono de contacto (celular colombiano de 10 dígitos)');\n}\n\nif (limpio(i.whatsapp_jid).endsWith('@lid') && !telefonoContacto) problemas.push('teléfono de contacto (celular de 10 dígitos: no pudimos ver tu número de WhatsApp)');\n\n// US-4: si viene un horario elegido, su fecha debe ser posterior a hoy.\nconst fecha = limpio(i.fecha_solicitada);\nif (fecha) {\n  const f = DateTime.fromISO(fecha, { zone: ZONA });\n  if (!f.isValid || f.startOf('day') <= hoy)\n    problemas.push(`horario (la fecha debe ser posterior a hoy, ${hoy.setLocale('es').toFormat(\"d 'de' LLLL\")}; vuelve a consultar horarios)`);\n}\n\nif (problemas.length)\n  return [{ json: { ok: false, faltantes: problemas, borrador, campos_guardados: Object.keys(borradorObj),\n    mensaje: `Faltan o no son válidos estos datos: ${problemas.join('; ')}. Pide SOLO esos datos, en un solo mensaje, y conserva los demás que ya dio.` } }];\n\nconst ABC = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // sin 0/O ni 1/I para dictarlo sin errores\nlet cod = '';\nfor (let k = 0; k < 6; k++) cod += ABC[Math.floor(Math.random() * ABC.length)];\nconst telefono = limpio(i.telefono).replace(/\\D/g, '');\nreturn [{ json: {\n  ok: true,\n  borrador,\n  id: 'UCU-' + cod,\n  fecha_solicitud: $now.setZone(ZONA).toFormat('dd/MM/yyyy HH:mm'),\n  telefono, whatsapp_jid: limpio(i.whatsapp_jid),\n  nombre, codigo, programa, edad: edadTxt ? edad : '', facultad,\n  tipo_documento: tipo.tipo, numero_documento: numero.toUpperCase(), correo,\n  telefono_contacto: telefonoContacto || telefono,\n  servicio: SERVICIOS[servicioClave], tipo_atencion: tipoAtencion, disponibilidad: limpio(i.disponibilidad),\n  fecha_solicitada: fecha, hora_solicitada: limpio(i.hora_solicitada),\n  profesional_solicitado: limpio(i.profesional_solicitado),\n} }];\n"
+      },
+      "id": "a43c61d2-121e-4819-b399-c6d3219925f3",
+      "name": "Preparar solicitud",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "=573234062106@s.whatsapp.net",
+        "messageText": "=🆕 *Nueva solicitud UnicaU · {{ $json.id }}*\n{{ $json.estado === 'PENDIENTE_VALIDACION' ? '⚠️ *Horario sin verificar:* revisa que siga libre antes de confirmar.\\n' : '' }}\n*Servicio:* {{ $json.servicio }} ({{ $json.tipo_atencion }})\n*Nombre:* {{ $json.nombre }}\n*Código:* {{ $json.codigo }}\n*Documento:* {{ $json.tipo_documento }} {{ $json.numero_documento }}\n*Programa:* {{ $json.programa }}\n*Correo:* {{ $json.correo }}\n*Teléfono de contacto:* +{{ $json.telefono_contacto }}\n*Horario elegido:* {{ $json.fecha_solicitada ? $json.fecha_solicitada + ' ' + $json.hora_solicitada + ' con ' + $json.profesional_solicitado : $json.disponibilidad }}\n*Pago:* {{ $json.requiere_pago === 'SI' ? 'requiere pago' + ($json.valor_pago ? ' (' + $json.valor_pago + ')' : '') + '. Genera el recibo, envíalo a ' + $json.correo + ' y cambia estado_pago a RECIBO_ENVIADO' : $json.requiere_pago === 'NO' ? 'no requiere' : 'POR CONFIRMAR. Define si tiene costo y actualiza requiere_pago y estado_pago' }}\n*WhatsApp:* +{{ $json.telefono }}\n\nPara confirmarla, en la hoja Solicitudes escribe fecha_cita, hora_cita y profesional_asignado, y cambia el estado a CONFIRMADA:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
+        "options_message": {}
+      },
+      "id": "c0263582-e865-4af6-a0f1-136d46dc2bdb",
+      "name": "WhatsApp a Natalia: nueva solicitud",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        1472,
+        -384
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Preparar solicitud').item.json.id }}",
+            "fecha_solicitud": "={{ $('Preparar solicitud').item.json.fecha_solicitud }}",
+            "nombre": "={{ $('Preparar solicitud').item.json.nombre }}",
+            "codigo": "={{ $('Preparar solicitud').item.json.codigo }}",
+            "programa": "={{ $('Preparar solicitud').item.json.programa }}",
+            "servicio": "={{ $('Preparar solicitud').item.json.servicio }}",
+            "disponibilidad": "={{ $('Preparar solicitud').item.json.disponibilidad }}",
+            "telefono": "={{ $('Preparar solicitud').item.json.telefono }}",
+            "whatsapp_jid": "={{ $('Preparar solicitud').item.json.whatsapp_jid }}",
+            "estado": "={{ $('Decidir registro').item.json.estado }}",
+            "notificado_encargada": "={{ $json.error ? '' : 'SI' }}",
+            "tipo_documento": "={{ $('Preparar solicitud').item.json.tipo_documento }}",
+            "numero_documento": "={{ $('Preparar solicitud').item.json.numero_documento }}",
+            "correo": "={{ $('Preparar solicitud').item.json.correo }}",
+            "telefono_contacto": "={{ $('Preparar solicitud').item.json.telefono_contacto }}",
+            "fecha_solicitada": "={{  $('Preparar solicitud').item.json.fecha_solicitada }}",
+            "hora_solicitada": "={{  $('Preparar solicitud').item.json.hora_solicitada }}",
+            "profesional_solicitado": "={{  $('Preparar solicitud').item.json.profesional_solicitado }}",
+            "tipo_atencion": "={{ $('Decidir registro').item.json.tipo_atencion }}",
+            "horario_verificado": "={{ $('Decidir registro').item.json.horario_verificado }}",
+            "requiere_pago": "={{ $('Decidir registro').item.json.requiere_pago }}",
+            "valor_pago": "={{ $('Decidir registro').item.json.valor_pago }}",
+            "estado_pago": "={{ $('Decidir registro').item.json.estado_pago }}",
+            "fecha_estado": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}",
+            "edad": "={{ $('Preparar solicitud').item.json.edad }}",
+            "facultad": "={{ $('Preparar solicitud').item.json.facultad }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "fecha_solicitud",
+              "displayName": "fecha_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "estado",
+              "displayName": "estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_cita",
+              "displayName": "fecha_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_cita",
+              "displayName": "hora_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "observaciones",
+              "displayName": "observaciones",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notificado_encargada",
+              "displayName": "notificado_encargada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notificado_cancelacion",
+              "displayName": "notificado_cancelacion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confirmacion_enviada",
+              "displayName": "confirmacion_enviada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recordatorio_enviado",
+              "displayName": "recordatorio_enviado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "tipo_documento",
+              "displayName": "tipo_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "numero_documento",
+              "displayName": "numero_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "correo",
+              "displayName": "correo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "franja_preferida",
+              "displayName": "franja_preferida",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "profesional_asignado",
+              "displayName": "profesional_asignado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "telefono_contacto",
+              "displayName": "telefono_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "requiere_pago",
+              "displayName": "requiere_pago",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "tipo_atencion",
+              "displayName": "tipo_atencion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "estado_pago",
+              "displayName": "estado_pago",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "fecha_comprobante",
+              "displayName": "fecha_comprobante",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "comprobante_ref",
+              "displayName": "comprobante_ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "aviso_pago_estado",
+              "displayName": "aviso_pago_estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "horario_verificado",
+              "displayName": "horario_verificado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "valor_pago",
+              "displayName": "valor_pago",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "fecha_estado",
+              "displayName": "fecha_estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "edad",
+              "displayName": "edad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "facultad",
+              "displayName": "facultad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "4d6e21b2-d317-4385-8cdc-9824145a23b3",
+      "name": "Guardar solicitud",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1696,
+        -416
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-8 · Respuesta para el agente después de intentar guardar la solicitud.\n// AC-1: trae servicio, profesional, fecha y hora solicitados. AC-2: dice si queda RECIBIDA o PENDIENTE.\n// AC-3 / US-9-AC-2: este nodo solo corre si Guardar solicitud funcionó. Si falló, su salida de error\n// va a \"Respuesta registro fallido\" y el agente NO puede decir que quedó registrada.\nconst d = $('Decidir registro').first().json;\nconst ZONA = 'America/Bogota';\nconst f = DateTime.fromISO(String(d.fecha_solicitada ?? ''), { zone: ZONA });\nconst h = String(d.hora_solicitada ?? '').match(/^(\\d{1,2}):(\\d{2})/);\nconst horaTxt = h ? `${(+h[1] % 12) || 12}:${h[2]} ${+h[1] < 12 ? 'a. m.' : 'p. m.'}` : '';\nconst cuando = f.isValid ? f.setLocale('es').toFormat(\"cccc d 'de' LLLL\") + (horaTxt ? `, ${horaTxt}` : '') : '';\nconst categoria = d.estado === 'PENDIENTE_VALIDACION' || (d.requiere_pago === 'SI') || d.requiere_pago === 'POR_CONFIRMAR' ? 'PENDIENTE' : 'RECIBIDA';\n\nconst partes = [`Solicitud ${d.id} registrada (${categoria}): ${d.servicio}${d.profesional_solicitado ? ', profesional solicitado ' + d.profesional_solicitado : ''}${cuando ? ', horario solicitado ' + cuando : ''}. Repite estos datos al estudiante.`];\nif (d.estado === 'PENDIENTE_VALIDACION')\n  partes.push('No fue posible verificar el horario en este momento: queda PENDIENTE DE VALIDACIÓN y Salud Integral lo revisará. Dilo así; no es una confirmación.');\nelse\n  partes.push('El horario elegido seguía disponible al registrar. Es una solicitud RECIBIDA, no una cita confirmada: Salud Integral asignará el profesional y confirmará por este chat.');\nif (d.requiere_pago === 'NO')\n  partes.push('Según las reglas de Salud Integral, esta atención no tiene costo.');\nelse if (d.requiere_pago === 'SI')\n  partes.push(`Esta atención requiere pago${d.valor_pago ? ' de ' + d.valor_pago : ''}. Salud Integral generará el recibo y lo enviará al correo del estudiante. Cuando pague, debe enviar por este chat una foto o PDF del comprobante. La cita solo se confirma cuando Salud Integral valide el pago.${d.instrucciones_pago ? ' ' + d.instrucciones_pago : ''}`);\nelse if (d.requiere_pago !== 'NO')\n  partes.push('Salud Integral le indicará si esta atención tiene algún costo. No menciones valores.');\nconst mensajeFinal = partes.join(' ').replace(/\\.\\. /g, '. ');\nreturn [{ json: { ok: true, id: d.id, categoria, estado: d.estado, servicio: d.servicio,\n  profesional: d.profesional_solicitado, cuando, requiere_pago: d.requiere_pago, estado_pago: d.estado_pago,\n  valor_pago: d.valor_pago, mensaje: mensajeFinal } }];\n"
+      },
+      "id": "ae0d90c6-b709-46e7-a9c6-d3d8eaf7e442",
+      "name": "Respuesta registrar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "id",
+              "lookupValue": "={{ String($json.id_solicitud ?? '').trim().toUpperCase() }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "bdab0f7f-8a4a-4657-8806-273cd30317cb",
+      "name": "Buscar solicitud",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        16,
+        208
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verifica que la solicitud exista, que pertenezca a ESTE número y que todavía se pueda cancelar.\n// US-7: RECHAZADA, CANCELADA y CERRADA son estados finales; CANCELACION_SOLICITADA ya está en trámite.\nconst i = $('Entrada herramienta').first().json;\nconst buscado = String(i.id_solicitud ?? '').trim().toUpperCase();\nconst tel = String(i.telefono ?? '').replace(/\\D/g, '');\nconst fila = $input.all().map(x => x.json)\n  .find(r => String(r.id ?? '').trim().toUpperCase() === buscado);\nconst no = motivo => [{ json: { ok: false, mensaje: motivo } }];\nif (!buscado || !fila) return no('No encontré una solicitud con ese código.');\nif (String(fila.telefono ?? '').replace(/\\D/g, '') !== tel)\n  return no('Esa solicitud no está asociada a este número de WhatsApp.');\nconst estado = String(fila.estado ?? '').trim().toUpperCase();\nif (estado === 'CANCELADA' || estado === 'CANCELACION_SOLICITADA')\n  return no('Esa solicitud ya estaba cancelada o en proceso de cancelación.');\nif (estado === 'RECHAZADA')\n  return no('Esa solicitud fue rechazada por Salud Integral, así que no hay nada que cancelar. Si necesitas una cita, puedo ayudarte con una solicitud nueva.');\nif (estado === 'CERRADA')\n  return no('Esa cita ya pasó y la solicitud está cerrada. Si necesitas otra cita, puedo ayudarte con una solicitud nueva.');\nreturn [{ json: { ok: true, ...fila } }];\n"
+      },
+      "id": "36c0fed0-7f0d-4c46-8ab0-cf5f17a117cb",
+      "name": "Validar cancelación",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "7d5ad693-5459-43b2-9195-6d8f583b074a",
+      "name": "¿Se puede cancelar?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        704,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "=573234062106@s.whatsapp.net",
+        "messageText": "=❌ *Cancelación UnicaU · {{ $json.id }}*\n\n{{ $json.nombre }} ({{ $json.codigo }}) canceló su solicitud de {{ $json.servicio }}.\nFecha registrada: {{ $json.fecha_cita || 'sin fecha asignada' }} {{ $json.hora_cita }}\n\nEse cupo queda libre para otro estudiante. Cuando lo liberes, cambia el estado a CANCELADA en la hoja:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
+        "options_message": {}
+      },
+      "id": "c4bfc814-0ba9-49db-9481-9f0fd054cfe0",
+      "name": "WhatsApp a Natalia: cancelación",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        992,
+        192
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Validar cancelación').item.json.id }}",
+            "estado": "CANCELACION_SOLICITADA",
+            "notificado_cancelacion": "={{ $json.error ? '' : 'SI' }}",
+            "fecha_estado": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitud",
+              "displayName": "fecha_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "estado",
+              "displayName": "estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_cita",
+              "displayName": "fecha_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "hora_cita",
+              "displayName": "hora_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "observaciones",
+              "displayName": "observaciones",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_encargada",
+              "displayName": "notificado_encargada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_cancelacion",
+              "displayName": "notificado_cancelacion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confirmacion_enviada",
+              "displayName": "confirmacion_enviada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "recordatorio_enviado",
+              "displayName": "recordatorio_enviado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "fecha_estado",
+              "displayName": "fecha_estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "eb8ff920-3b49-4130-9e6a-3326d928fe97",
+      "name": "Marcar cancelación",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1184,
+        272
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $('Validar cancelación').first().json;\nreturn [{ json: { ok: true, id: f.id,\n  mensaje: `Cancelación de ${f.id} registrada. La encargada fue notificada para liberar el cupo.` } }];"
+      },
+      "id": "25c39654-6e55-45af-9f40-6fb9673fe78a",
+      "name": "Respuesta cancelación",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json }];"
+      },
+      "id": "de4a2484-f9f7-44fc-97a8-7aeefdb5f18a",
+      "name": "Respuesta rechazo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "=573234062106@s.whatsapp.net",
+        "messageText": "=🙋 *UnicaU: un estudiante pide hablar con una persona*\n\n*Nombre:* {{ $json.nombre_perfil || 'sin nombre' }}\n*WhatsApp:* +{{ $json.telefono }}\n*Motivo:* {{ $json.motivo || 'no indicado' }}\n*Último mensaje:* {{ $json.ultimo_mensaje }}\n\nSi le escribes desde el número de UnicaU, el bot se pausa en ese chat. Para devolverle el control escribe ACTIVAR BOT en ese mismo chat.​",
+        "options_message": {}
+      },
+      "id": "f1df3f13-f5ad-4887-855a-f7becb6eae42",
+      "name": "Avisar a Natalia",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        464
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ok: true, mensaje: 'La encargada de Salud Integral fue notificada y responderá por este chat en horario de atención.' } }];"
+      },
+      "id": "7a85db3e-12b5-4eda-b033-da1482c38cba",
+      "name": "Respuesta escalar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "076e07c5-7d82-47c5-bee1-8d6068407f19",
+      "name": "¿Registro válido?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        400,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-9-AC-4 · Cuando faltan datos, responde qué falta y confirma que lo demás quedó guardado (Borradores).\nconst p = $('Preparar solicitud').first().json;\nreturn [{ json: { ok: false, faltantes: p.faltantes, datos_guardados: p.campos_guardados,\n  mensaje: (p.mensaje || 'Faltan datos.') + ' Los demás datos quedaron guardados: no los vuelvas a pedir.' } }];\n"
+      },
+      "id": "c248ccb2-ef16-4892-8802-4ca15f6a4d4e",
+      "name": "Respuesta registro inválido",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-4 · Valida el servicio y la fecha ANTES de consultar la agenda.\n// US-2 · Deja pasar la preferencia de profesional (opcional) para filtrar los horarios.\n// US-5 · Modo \"verificar\": la usa el registro para revisar, justo antes de guardar, que el horario\n//        elegido (fecha_solicitada, hora_solicitada, profesional_solicitado) siga libre.\n// No tiene IDs de carpetas: la carpeta del mes se busca sola más adelante (ver \"Elegir carpetas del mes\").\nconst ZONA = 'America/Bogota';\nconst SERVICIOS = ['psicologia', 'medicina', 'odontologia'];\n\nconst i = $('Entrada herramienta').first().json;\nconst hoy = DateTime.now().setZone(ZONA).startOf('day');\nconst norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();\nconst no = mensaje => [{ json: { ok: false, mensaje } }];\nconst bonito = d => d.setLocale('es').toFormat(\"cccc d 'de' LLLL\");\n\nconst servicio = SERVICIOS.find(k => norm(i.servicio).includes(k));\nif (!servicio) return no('Servicio no reconocido. Debe ser psicología, medicina u odontología.');\n\nconst verificar = norm(i.accion) === 'verificar';\nconst horaVerificar = String(i.hora_solicitada ?? '').trim().match(/^(\\d{1,2}):(\\d{2})/);\nif (verificar && (!String(i.fecha_solicitada ?? '').trim() || !horaVerificar))\n  return no('No hay un horario elegido para verificar.');\n\n// Sin fecha = buscar desde mañana. La fecha debe ser posterior a hoy (FR5).\nlet desde = hoy.plus({ days: 1 });\nconst pedida = String(verificar ? i.fecha_solicitada : i.fecha_desde ?? '').trim();\nif (pedida) {\n  const f = DateTime.fromISO(pedida, { zone: ZONA });\n  if (!f.isValid) return no('No entendí la fecha. Pide una fecha concreta, por ejemplo \"12 de noviembre\".');\n  if (f.startOf('day') <= hoy)\n    return no(`La cita debe ser para una fecha posterior a hoy (${bonito(hoy)}). Pide otra fecha a partir de ${bonito(hoy.plus({ days: 1 }))}.`);\n  desde = f.startOf('day');\n}\n\nconst fr = norm(i.franja);\nreturn [{ json: {\n  ok: true,\n  modo: verificar ? 'verificar' : 'consultar',\n  servicio,\n  desde: desde.toISODate(),\n  franja: verificar ? '' : fr.startsWith('m') ? 'mañana' : fr.startsWith('t') ? 'tarde' : '',\n  // Al verificar se buscan horarios de TODOS los profesionales, para poder ofrecer alternativas;\n  // el profesional elegido se compara después, en \"Armar respuesta\".\n  profesional: verificar ? '' : String(i.profesional ?? '').trim(),   // vacío = cualquier profesional\n  hora_verificar: verificar ? horaVerificar[1].padStart(2, '0') + ':' + horaVerificar[2] : '',\n  profesional_verificar: verificar ? String(i.profesional_solicitado ?? '').trim() : '',\n} }];\n"
+      },
+      "id": "90f1d4d3-9b77-400a-9972-4a032a0fd52f",
+      "name": "Validar consulta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "173c35c0-f2f3-47a2-9dda-22eb18756abf",
+      "name": "¿Consulta válida?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        32,
+        992
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1514266939,
+          "mode": "list",
+          "cachedResultName": "Config",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g/edit#gid=1514266939"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "clave",
+              "lookupValue": "carpeta_raiz_id"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "376dd74e-5e87-4d4f-8ab7-86ad944ff452",
+      "name": "Leer configuración",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        400,
+        800
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "fileFolder",
+        "searchMethod": "query",
+        "queryString": "='{{ $json.valor }}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        "returnAll": true,
+        "filter": {},
+        "options": {}
+      },
+      "id": "c0c2be98-b558-47c2-adb2-ab1002a8bfd7",
+      "name": "Listar carpetas de años",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        608,
+        800
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Variante automática: no hay IDs por año.\n// \"Leer configuración\" trae una sola fila: clave = carpeta_raiz_id | valor = <ID de la carpeta raíz>.\n// \"Listar carpetas de años\" trae las subcarpetas de la raíz; aquí se reconoce el año por el NOMBRE\n// (\"2026\", \"Año 2027\", \"AGENDAS 2028\"...). Se ignoran copias y respaldos.\nconst MESES_A_CONSULTAR = 2;\nconst ZONA = 'America/Bogota';\nconst IGNORAR = /\\b(COPIA|COPY|RESPALDO|BACKUP|BORRADOR|OLD|ANTIGUO)\\b/;\nconst c = $('Validar consulta').first().json;\nconst raiz = String($('Leer configuración').first().json.valor ?? '').trim();\nconst norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()\n  .replace(/[^A-Z0-9]+/g, ' ').trim();\nconst no = mensaje => [{ json: { ok: false, mensaje } }];\n\nif (!raiz)\n  return no('No pude consultar la agenda por un problema de configuración. No ofrezcas horarios; registra la solicitud para que Salud Integral la gestione.');\n\nconst desde = DateTime.fromISO(c.desde, { zone: ZONA }).startOf('month');\nconst meses = Array.from({ length: MESES_A_CONSULTAR }, (_, k) => desde.plus({ months: k }));\nconst anios = new Set(meses.map(d => d.year));\n\nconst carpetas = $input.all().map(x => x.json)\n  .filter(f => f.id && f.name && !IGNORAR.test(norm(f.name)))\n  .map(f => ({ id: f.id, anio: Number(norm(f.name).split(' ').find(p => /^20\\d{2}$/.test(p))) }))\n  .filter(f => anios.has(f.anio));\n\nif (!carpetas.length)\n  return no(`Todavía no hay agenda publicada para ${desde.setLocale('es').toFormat(\"LLLL 'de' yyyy\")}. Ofrece buscar en otra fecha o registrar la solicitud para que Salud Integral la gestione.`);\n\nconst q = s => String(s).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\");\nreturn [{ json: {\n  ok: true,\n  anio_por_carpeta: Object.fromEntries(carpetas.map(x => [x.id, x.anio])),\n  meses_buscados: meses.map(d => d.year * 100 + d.month),\n  query_meses: `(${carpetas.map(x => `'${q(x.id)}' in parents`).join(' or ')}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,\n} }];\n"
+      },
+      "id": "036ea741-f1f5-45ba-8def-f52d01fa6615",
+      "name": "Elegir carpetas del año",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        864,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "87cde1fe-7b90-48ce-83ec-b919b95a4251",
+      "name": "¿Hay agenda del año?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1056,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "fileFolder",
+        "searchMethod": "query",
+        "queryString": "={{ $json.query_meses }}",
+        "returnAll": true,
+        "filter": {},
+        "options": {
+          "fields": [
+            "*"
+          ]
+        }
+      },
+      "id": "3d1fb38e-649a-4cb5-afff-b66bbdca95c9",
+      "name": "Listar carpetas de meses",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1280,
+        720
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Dentro de las carpetas de año, encuentra las de los meses que hay que consultar, por su NOMBRE.\n// Acepta \"NOVIEMBRE\", \"Noviembre\", \"NOV\", \"11\", \"11_NOVIEMBRE\", \"NOVIEMBRE_2026\"...\n// El año lo pone la carpeta padre; si el nombre trae otro año, se ignora la carpeta.\nconst MESES = { ENERO: 1, FEBRERO: 2, MARZO: 3, ABRIL: 4, MAYO: 5, JUNIO: 6, JULIO: 7, AGOSTO: 8,\n  SEPTIEMBRE: 9, SETIEMBRE: 9, OCTUBRE: 10, NOVIEMBRE: 11, DICIEMBRE: 12 };\nconst ABREV = { ENE: 1, FEB: 2, MAR: 3, ABR: 4, MAY: 5, JUN: 6, JUL: 7, AGO: 8, SEP: 9, SET: 9, OCT: 10, NOV: 11, DIC: 12 };\nconst IGNORAR = /\\b(COPIA|COPY|RESPALDO|BACKUP|BORRADOR|OLD|ANTIGUO)\\b/;\nconst ZONA = 'America/Bogota';\n\nconst a = $('Elegir carpetas del año').first().json;\nconst c = $('Validar consulta').first().json;\nconst norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()\n  .replace(/[^A-Z0-9]+/g, ' ').trim();\n\nfunction mesDeNombre(nombre) {\n  const palabras = norm(nombre).split(' ');\n  const anio = palabras.find(p => /^20\\d{2}$/.test(p));\n  const mes = palabras.map(p => MESES[p]).find(Boolean)\n    ?? palabras.map(p => ABREV[p]).find(Boolean)\n    ?? palabras.filter(p => /^\\d{1,2}$/.test(p)).map(Number).find(n => n >= 1 && n <= 12);\n  return mes ? { mes, anio: anio ? Number(anio) : null } : null;\n}\n\nconst quiero = new Set(a.meses_buscados);\nconst elegidas = [];\nfor (const it of $input.all()) {\n  const f = it.json;\n  if (!f.id || !f.name || IGNORAR.test(norm(f.name))) continue;\n  const padre = (f.parents ?? []).find(p => a.anio_por_carpeta[p]);\n  const anioPadre = padre ? a.anio_por_carpeta[padre] : null;\n  const m = mesDeNombre(f.name);\n  if (!m || !anioPadre) continue;\n  if (m.anio && m.anio !== anioPadre) continue;\n  if (quiero.has(anioPadre * 100 + m.mes)) elegidas.push(f);\n}\n\nif (!elegidas.length) {\n  const d = DateTime.fromISO(c.desde, { zone: ZONA });\n  return [{ json: { ok: false, mensaje: `Todavía no hay agenda publicada para ${d.setLocale('es').toFormat(\"LLLL 'de' yyyy\")}. Ofrece buscar en otra fecha o registrar la solicitud para que Salud Integral la gestione.` } }];\n}\nconst q = s => String(s).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\");\nreturn [{ json: {\n  ok: true,\n  carpetas_mes: elegidas.map(f => f.name),\n  query_servicios: `(${elegidas.map(f => `'${q(f.id)}' in parents`).join(' or ')}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,\n} }];\n"
+      },
+      "id": "087482b2-fafc-4d80-9b2f-a46c56f85ff9",
+      "name": "Elegir carpetas del mes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "3824a7a8-b043-4c6a-a33b-3b5d4d98693d",
+      "name": "¿Hay agenda del mes?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1760,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "fileFolder",
+        "searchMethod": "query",
+        "queryString": "={{ $json.query_servicios }}",
+        "returnAll": true,
+        "filter": {},
+        "options": {}
+      },
+      "id": "a0691d76-7956-42ae-bdc0-07d10c76672e",
+      "name": "Listar carpetas de servicio",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2000,
+        720
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// De las subcarpetas de los meses encontrados, se queda con las del servicio pedido.\n// Tolera mayúsculas, tildes y espacios: \"PSICOLOGIA\", \"Psicología\", \"MEDICINA GENERAL\", \"Odontología\".\nconst RAIZ_SERVICIO = { psicologia: 'PSICOLOG', medicina: 'MEDICINA', odontologia: 'ODONTOLOG' };\nconst c = $('Validar consulta').first().json;\nconst norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase();\nconst raizNombre = RAIZ_SERVICIO[c.servicio];\n\nconst carpetas = $input.all().map(x => x.json).filter(f => f.id && norm(f.name).includes(raizNombre));\nif (!carpetas.length)\n  return [{ json: { ok: false, mensaje: `Todavía no hay agenda de ${c.servicio} publicada para esas fechas. Ofrece buscar en otra fecha o registrar la solicitud para que Salud Integral la gestione.` } }];\n\nconst q = s => String(s).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\");\nreturn [{ json: {\n  ok: true,\n  query_agendas: `(${carpetas.map(f => `'${q(f.id)}' in parents`).join(' or ')}) and trashed = false and (mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType = 'application/vnd.google-apps.spreadsheet')`,\n} }];\n"
+      },
+      "id": "ddb9c978-9a81-44b5-93ce-c5cadd98d551",
+      "name": "Elegir carpeta del servicio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "de17a15e-8eee-4c3f-85a3-115504eea569",
+      "name": "¿Hay agenda del servicio?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2480,
+        864
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "fileFolder",
+        "searchMethod": "query",
+        "queryString": "={{ $json.query_agendas }}",
+        "returnAll": true,
+        "filter": {},
+        "options": {}
+      },
+      "id": "06c1e081-e901-4551-929f-82a68d27e27c",
+      "name": "Buscar agendas del servicio",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2816,
+        848
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "7be6a23b-2db0-4288-be2e-72cc9884f883",
+      "name": "Descargar agenda",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        3040,
+        848
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// El nodo Compression solo abre archivos con extensión .zip. Un .xlsx ES un .zip por dentro,\n// así que aquí solo se cambia la etiqueta de la extensión de la copia descargada.\n// El archivo de Erika en Drive no se toca.\nreturn $input.all().map(item => {\n  if (item.binary?.data) {\n    item.binary.data.fileExtension = 'zip';\n    item.binary.data.fileName = String(item.binary.data.fileName ?? 'agenda') + '.zip';\n  }\n  return item;\n});\n"
+      },
+      "id": "40ab798f-64d4-4a94-82d5-74cffa6b2500",
+      "name": "Preparar descompresión",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3264,
+        848
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "1aabf8e5-b204-477a-a843-be81f7e9f279",
+      "name": "Descomprimir xlsx",
+      "type": "n8n-nodes-base.compression",
+      "typeVersion": 1.1,
+      "position": [
+        3488,
+        848
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-3 · Lee las agendas de Erika directamente desde el Excel (.xlsx) y devuelve solo los horarios LIBRES.\n// Llega un item por profesional con las partes internas del .xlsx ya descomprimidas (nodo Compression).\n// Un .xlsx es un ZIP de archivos XML: aquí se leen los valores de las celdas Y las celdas combinadas,\n// sin convertir ni modificar el archivo original.\n//   - LIBRE: la fila del horario no tiene nada escrito en A:E.\n//   - OCUPADO: hay un estudiante (o cualquier texto) en A:E.\n//   - BLOQUEADO: la fila está dentro de una combinación de celdas que abarca A:E (\"OCUPADO\", \"CONGRESO\"...).\n// En la tabla de la tarde las horas se escriben sin am/pm: \"2:00\" se interpreta como 14:00.\n// US-2: devuelve también los profesionales del servicio y, si el estudiante pidió uno, filtra por él.\n// US-5: ya no elige las 6 opciones: entrega TODOS los horarios libres (candidatos) al nodo\n//       \"Armar respuesta\", que descuenta los apartados por otras solicitudes y arma la respuesta.\nconst ZONA = 'America/Bogota';\nconst MESES = { ENERO: 1, FEBRERO: 2, MARZO: 3, ABRIL: 4, MAYO: 5, JUNIO: 6, JULIO: 7, AGOSTO: 8,\n  SEPTIEMBRE: 9, SETIEMBRE: 9, OCTUBRE: 10, NOVIEMBRE: 11, DICIEMBRE: 12 };\n\nconst c = $('Validar consulta').first().json;\nconst ahora = DateTime.now().setZone(ZONA);\nconst manana = ahora.startOf('day').plus({ days: 1 });   // nunca hoy ni antes (FR5)\nconst desde = DateTime.fromISO(c.desde, { zone: ZONA }).startOf('day');\nconst norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().trim();\nconst titulo = s => String(s).toLowerCase().replace(/(^|\\s)\\S/g, t => t.toUpperCase());\n\n// ---------- Lectura del XML del Excel ----------\nconst ENT = { amp: '&', lt: '<', gt: '>', quot: '\"', apos: \"'\" };\nconst dec = s => String(s).replace(/&(#x[0-9a-fA-F]+|#\\d+|amp|lt|gt|quot|apos);/g, (m, e) =>\n  e[0] !== '#' ? ENT[e] : String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)));\nconst textoDe = xml => [...String(xml).matchAll(/<t(?:\\s[^>]*)?>([\\s\\S]*?)<\\/t>/g)].map(m => dec(m[1])).join('');\nconst atributo = (attrs, nombre) => (attrs.match(new RegExp('(?:^|\\\\s)' + nombre + '=\"([^\"]*)\"')) ?? [])[1];\nconst columna = ref => [...ref.match(/^[A-Z]+/)[0]].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;\nconst filaDe = ref => Number(ref.match(/\\d+$/)[0]) - 1;\nconst base = p => String(p).split('/').pop();\n\nasync function leerLibro(idx, binary) {\n  // Partes del ZIP por ruta (xl/workbook.xml, xl/worksheets/sheet1.xml, ...)\n  const partes = {};\n  for (const [clave, meta] of Object.entries(binary ?? {})) {\n    const ruta = [meta.directory, meta.fileName].filter(Boolean).join('/').replace(/^\\/+/, '');\n    partes[ruta] = clave;\n  }\n  const buscar = ruta => partes[ruta] ?? Object.entries(partes).find(([r]) => base(r) === base(ruta))?.[1];\n  const leer = async ruta => {\n    const clave = buscar(ruta);\n    return clave ? (await this.helpers.getBinaryDataBuffer(idx, clave)).toString('utf8') : '';\n  };\n\n  const workbook = await leer('xl/workbook.xml');\n  if (!workbook) return [];\n  const rels = await leer('xl/_rels/workbook.xml.rels');\n  const destino = {};\n  for (const m of rels.matchAll(/<Relationship\\b([^>]*)\\/?>/g))\n    destino[atributo(m[1], 'Id')] = atributo(m[1], 'Target');\n  const compartidos = [...(await leer('xl/sharedStrings.xml')).matchAll(/<si>([\\s\\S]*?)<\\/si>/g)].map(m => textoDe(m[1]));\n\n  const hojas = [];\n  for (const m of workbook.matchAll(/<sheet\\b([^>]*)\\/?>/g)) {\n    const nombre = dec(atributo(m[1], 'name') ?? '');\n    const objetivo = destino[atributo(m[1], 'r:id')] ?? '';\n    const xml = await leer(objetivo.startsWith('/') ? objetivo.slice(1) : 'xl/' + objetivo);\n    if (!xml) continue;\n    const filas = [];\n    for (const cm of xml.matchAll(/<c\\b([^>]*?)(?:\\/>|>([\\s\\S]*?)<\\/c>)/g)) {\n      const ref = atributo(cm[1], 'r');\n      if (!ref) continue;\n      const tipo = atributo(cm[1], 't') ?? 'n';\n      const cuerpo = cm[2] ?? '';\n      const v = (cuerpo.match(/<v>([\\s\\S]*?)<\\/v>/) ?? [])[1];\n      let valor = '';\n      if (tipo === 's') valor = compartidos[Number(v)] ?? '';\n      else if (tipo === 'inlineStr') valor = textoDe(cuerpo);\n      else if (tipo === 'str' || tipo === 'e') valor = dec(v ?? '');\n      else if (v !== undefined && v !== '') valor = Number(v);\n      const r = filaDe(ref), col = columna(ref);\n      (filas[r] ??= [])[col] = typeof valor === 'string' ? valor.trim() : valor;\n    }\n    const combinadas = [...xml.matchAll(/<mergeCell\\b[^>]*ref=\"([A-Z]+\\d+):([A-Z]+\\d+)\"/g)].map(mm => ({\n      r0: filaDe(mm[1]), r1: filaDe(mm[2]), c0: columna(mm[1]), c1: columna(mm[2]),\n    }));\n    hojas.push({ nombre, filas, combinadas });\n  }\n  return hojas;\n}\n\n// Hora de la columna F: número de Excel (fracción del día) o texto \"2:00\".\nfunction horaDe(v) {\n  if (typeof v === 'number' && v >= 0 && v < 1) { const min = Math.round(v * 1440); return [Math.floor(min / 60), min % 60]; }\n  const m = String(v ?? '').match(/^(\\d{1,2}):(\\d{2})/);\n  return m ? [Number(m[1]), Number(m[2])] : null;\n}\n\n// ---------- Recorrido de cada agenda ----------\nconst cupos = [];\nconst items = $input.all();\nfor (let idx = 0; idx < items.length; idx++) {\n  const hojas = await leerLibro.call(this, idx, items[idx].binary);\n  const archivo = String(items[idx].json?.name ?? '').replace(/\\.xlsx$/i, '').replace(/_/g, ' ');\n  for (const hoja of hojas) {\n    const celda = (r, col) => hoja.filas[r]?.[col] ?? '';\n    const texto = (r, col) => String(celda(r, col)).trim();\n\n    // Filas tapadas por una combinación que cubre las columnas A a E.\n    const bloqueadas = new Map();\n    for (const m of hoja.combinadas)\n      if (m.c0 === 0 && m.c1 >= 4)\n        for (let r = m.r0; r <= m.r1; r++) bloqueadas.set(r, texto(m.r0, 0) || 'OCUPADO');\n\n    let profesional = '', anio = null, mes = null, dia = null, tabla = 0;\n    for (let r = 0; r < hoja.filas.length; r++) {\n      const A = norm(texto(r, 0)), E = norm(texto(r, 4)), F = norm(texto(r, 5));\n      // \"Psicólogo:  CAROLINA ARIAS\" (o Médico:, Odontóloga:)\n      if (!profesional && A.includes(':') && /(PSICOLOG|MEDIC|ODONTOLOG|PROFESIONAL)/.test(A))\n        profesional = texto(r, 0).split(':').slice(1).join(':').trim();\n      // Fila de fecha: E = \"Fecha: NOVIEMBRE // 2026\", F = \"Dia:\", y el día en G (texto \"MARTES 3\", número 3 o fecha)\n      if (E.startsWith('FECHA') && F.startsWith('DIA')) {\n        const mesTxt = Object.keys(MESES).find(k => E.includes(k));\n        mes = mesTxt ? MESES[mesTxt] : null;\n        anio = Number(E.match(/(20\\d{2})/)?.[1] ?? ahora.year);\n        dia = null;\n        for (const col of [6, 7, 8]) {\n          const v = celda(r, col);\n          if (typeof v === 'number' && v > 20000) {           // una fecha real de Excel\n            const d = DateTime.fromObject({ year: 1899, month: 12, day: 30 }, { zone: ZONA }).plus({ days: Math.floor(v) });\n            anio = d.year; mes = d.month; dia = d.day; break;\n          }\n          const n = String(v).match(/\\b(\\d{1,2})\\b/);\n          if (n) { dia = Number(n[1]); break; }\n        }\n        if (!dia) dia = Number(texto(r, 5).match(/\\b(\\d{1,2})\\b/)?.[1] ?? 0) || null;\n        tabla = 0;\n        continue;\n      }\n      if (F === 'HORA') { tabla++; continue; }          // 1 = mañana, 2 = tarde\n      const h = horaDe(celda(r, 5));\n      if (!h || !mes || !dia || tabla === 0) continue;\n      let [hora, minuto] = h;\n      if (tabla >= 2 && hora < 12) hora += 12;\n      const fecha = DateTime.fromObject({ year: anio, month: mes, day: dia, hour: hora, minute: minuto }, { zone: ZONA });\n      if (!fecha.isValid) continue;\n      let estado = 'LIBRE';\n      if (bloqueadas.has(r)) estado = 'BLOQUEADO';\n      else if ([0, 1, 2, 3, 4].some(col => texto(r, col))) estado = 'OCUPADO';\n      cupos.push({ fecha, estado, profesional: titulo(profesional || archivo) });\n    }\n  }\n}\n\nif (!cupos.length)\n  return [{ json: { ok: false, mensaje: 'No pude leer la agenda de este servicio. No ofrezcas horarios; pide que lo intente más tarde o registra la solicitud para que Salud Integral la gestione.' } }];\n\n// Si un mismo profesional aparece en dos archivos (por ejemplo un .xlsx y su copia en Sheets),\n// gana el estado más restrictivo: nunca se ofrece un horario que alguna copia marca como tomado.\nconst PESO = { LIBRE: 0, OCUPADO: 1, BLOQUEADO: 2 };\nconst unicos = new Map();\nfor (const x of cupos) {\n  const k = norm(x.profesional) + '|' + x.fecha.toISO();\n  if (!unicos.has(k) || PESO[x.estado] > PESO[unicos.get(k).estado]) unicos.set(k, x);\n}\n\n// US-2-AC-2: profesionales que atienden este servicio (según las agendas leídas).\nconst profesionales = [...new Set([...unicos.values()].map(x => x.profesional))].sort();\n// Preferencia opcional: basta con una parte del nombre (\"Carolina\", \"Vasquez\").\nconst pref = norm(c.profesional ?? '').split(' ').filter(p => p.length >= 3);\nconst coincide = x => !pref.length || pref.every(p => norm(x.profesional).includes(p));\nif (pref.length && !profesionales.some(nombre => coincide({ profesional: nombre })))\n  return [{ json: { ok: true, servicio: c.servicio, desde: c.desde, profesionales, candidatos: [],\n    mensaje_sin_resultados: `No encontré a \"${c.profesional}\" en las agendas de ${c.servicio}. Atienden: ${profesionales.join(', ')}. Pregunta si quiere a otro profesional o cualquiera.` } }];\n\nconst candidatos = [...unicos.values()]\n  .filter(x => x.estado === 'LIBRE' && x.fecha >= desde && x.fecha >= manana)\n  .filter(coincide)\n  .filter(x => !c.franja || (c.franja === 'mañana' ? x.fecha.hour < 12 : x.fecha.hour >= 12))\n  .sort((a, b) => a.fecha.toMillis() - b.fecha.toMillis())\n  .map(x => ({\n    fecha: x.fecha.toISODate(),\n    hora: x.fecha.toFormat('HH:mm'),\n    texto: x.fecha.setLocale('es').toFormat(\"cccc d 'de' LLLL, h:mm a\"),\n    profesional: x.profesional,\n  }));\n\nreturn [{ json: {\n  ok: true,\n  servicio: c.servicio,\n  desde: c.desde,\n  franja: c.franja || 'cualquiera',\n  profesional: c.profesional || 'cualquiera',\n  profesionales,\n  candidatos,\n} }];\n"
+      },
+      "id": "ad94a52a-c965-40e0-b7b0-d74caf8b95ed",
+      "name": "Interpretar agenda",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3712,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json }];"
+      },
+      "id": "f368d4f2-99c9-4d86-a1d9-48f21d8cc35e",
+      "name": "Respuesta consulta inválida",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2592,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "8a3e8e6b-3215-4747-9723-585657192bbe",
+      "name": "Leer solicitudes activas",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3936,
+        848
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// v2 (US-9): cancelaciones en trámite siguen apartadas; sin horarios sugiere otra fecha.\n// US-3 / US-5 · Último paso de la rama de horarios.\n// Recibe las filas de la hoja Solicitudes (nodo \"Leer solicitudes activas\") y los horarios libres de las\n// agendas (\"Interpretar agenda\"). Un horario que ya eligió otra solicitud activa queda APARTADO y no se\n// ofrece, aunque Erika todavía no lo haya escrito en su agenda.\n//   - modo \"consultar\": devuelve hasta 6 opciones libres y no apartadas.\n//   - modo \"verificar\": responde si el horario elegido sigue disponible (US-5-AC-1) y, si no, ofrece\n//     otras opciones (US-5-AC-2). Si algo no se pudo leer, responde verificado:false (US-5-AC-3).\nconst ZONA = 'America/Bogota';\nconst MAX_OPCIONES = 6;\n// US-9-AC-3: una cancelación en trámite sigue apartando el horario hasta que Salud Integral la confirme.\nconst ACTIVOS = ['PENDIENTE', 'PENDIENTE_VALIDACION', 'CONFIRMADA', 'CANCELACION_SOLICITADA'];\n\nconst v = $('Validar consulta').first().json;\nconst r = $('Interpretar agenda').first().json;\nconst norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()\n  .replace(/[^A-Z0-9]+/g, ' ').trim();\n\n// ¿No se pudo leer la agenda? En consulta se devuelve el mensaje tal cual; en verificación, no verificado.\nif (!r.ok) {\n  if (v.modo === 'verificar')\n    return [{ json: { ok: false, verificado: false, mensaje: 'No fue posible verificar el horario en la agenda.' } }];\n  return [{ json: r }];\n}\n\n// ---------- Horarios apartados por otras solicitudes ----------\nfunction fechaISO(f) {\n  if (f === '' || f == null) return '';\n  if (typeof f === 'number')\n    return DateTime.fromObject({ year: 1899, month: 12, day: 30 }, { zone: ZONA }).plus({ days: Math.floor(f) }).toISODate();\n  const s = String(f).trim();\n  for (const fmt of ['yyyy-MM-dd', 'dd/MM/yyyy', 'd/M/yyyy']) {\n    const d = DateTime.fromFormat(s, fmt, { zone: ZONA });\n    if (d.isValid) return d.toISODate();\n  }\n  return '';\n}\nfunction horaHHmm(h) {\n  if (h === '' || h == null) return '';\n  if (typeof h === 'number') { const m = Math.round((h % 1) * 1440); return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; }\n  const m = String(h).trim().toLowerCase().replace(/\\s+/g, '').replace(/\\./g, '').match(/^(\\d{1,2})(?::(\\d{2}))?(am|pm)?$/);\n  if (!m) return '';\n  let hour = +m[1]; const minute = m[2] ? +m[2] : 0;\n  if (m[3] === 'pm' && hour < 12) hour += 12;\n  if (m[3] === 'am' && hour === 12) hour = 0;\n  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;\n}\nconst clave = (fecha, hora, prof) => `${fecha}|${hora}|${norm(prof)}`;\n\nconst entrada = $input.all().map(x => x.json);\nconst errorHoja = entrada.some(f => f && f.error);\nconst apartados = new Set();\nfor (const f of entrada) {\n  if (!f || !f.id) continue;\n  const estado = String(f.estado ?? '').trim().toUpperCase();\n  if (!ACTIVOS.includes(estado)) continue;\n  const prof = f.profesional_asignado || f.profesional_solicitado;\n  if (f.fecha_solicitada && f.hora_solicitada)\n    apartados.add(clave(fechaISO(f.fecha_solicitada), horaHHmm(f.hora_solicitada), f.profesional_solicitado || prof));\n  if (estado === 'CONFIRMADA' && f.fecha_cita && f.hora_cita)\n    apartados.add(clave(fechaISO(f.fecha_cita), horaHHmm(f.hora_cita), prof));\n}\nconst libres = r.candidatos.filter(x => !apartados.has(clave(x.fecha, x.hora, x.profesional)));\nconst numerar = lista => lista.slice(0, MAX_OPCIONES).map((x, n) => ({ opcion: n + 1, ...x }));\n\n// ---------- Modo verificar (US-5) ----------\nif (v.modo === 'verificar') {\n  if (errorHoja)\n    return [{ json: { ok: false, verificado: false, mensaje: 'No fue posible revisar las solicitudes registradas.' } }];\n  const sigue = libres.some(x => x.fecha === v.desde && x.hora === v.hora_verificar &&\n    (!v.profesional_verificar || norm(x.profesional) === norm(v.profesional_verificar)));\n  if (sigue) return [{ json: { ok: true, verificado: true, disponible: true } }];\n  const opciones = numerar(libres);\n  return [{ json: { ok: true, verificado: true, disponible: false, opciones,\n    mensaje: opciones.length\n      ? 'El horario elegido ya no está disponible. Ofrece SOLO estas otras opciones, numeradas.'\n      : 'El horario elegido ya no está disponible y no hay otros horarios libres desde esa fecha. Ofrece buscar otra fecha.' } }];\n}\n\n// ---------- Modo consultar (US-3) ----------\nconst opciones = numerar(libres);\n// US-9-AC-1: si no hay horarios, se sugiere buscar una semana después, conservando servicio y profesional.\nconst fecha_sugerida = opciones.length ? '' : DateTime.fromISO(String(r.desde || ''), { zone: ZONA }).plus({ days: 7 }).toISODate() || '';\nreturn [{ json: {\n  ok: true,\n  fecha_sugerida,\n  servicio: r.servicio,\n  desde: r.desde,\n  franja: r.franja,\n  profesional: r.profesional,\n  profesionales: r.profesionales,\n  total_libres: libres.length,\n  opciones,\n  mensaje: r.mensaje_sin_resultados\n    ?? (opciones.length\n      ? `Hay ${libres.length} horarios libres. Ofrece SOLO estas opciones, numeradas, sin inventar otras.`\n      : `No hay horarios libres de ${r.servicio}${v.profesional ? ' con ' + v.profesional : ''} desde ${r.desde}${v.franja ? ' en la ' + v.franja : ''}. Dilo con claridad y ofrece: buscar desde ${fecha_sugerida || 'otra fecha'}, otra franja${v.profesional ? ' u otro profesional' : ''}. Conserva el servicio${v.profesional ? ' y el profesional' : ''}; si acepta, vuelve a usar consultar_horarios.`),\n} }];\n"
+      },
+      "id": "4d7d7794-5b1a-4b3f-9146-317d0f367de0",
+      "name": "Armar respuesta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4160,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "A4Pgkq5rbnBw26ef",
+          "mode": "list",
+          "cachedResultName": "· 0 · Herramientas (sub-workflow)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "accion": "verificar",
+            "servicio": "={{ $json.servicio }}",
+            "fecha_solicitada": "={{ $json.fecha_solicitada }}",
+            "hora_solicitada": "={{ $json.hora_solicitada }}",
+            "profesional_solicitado": "={{ $json.profesional_solicitado }}",
+            "telefono": "={{ $json.telefono }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "accion",
+              "displayName": "accion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre_perfil",
+              "displayName": "nombre_perfil",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id_solicitud",
+              "displayName": "id_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "motivo",
+              "displayName": "motivo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ultimo_mensaje",
+              "displayName": "ultimo_mensaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_desde",
+              "displayName": "fecha_desde",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "franja",
+              "displayName": "franja",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_documento",
+              "displayName": "tipo_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_documento",
+              "displayName": "numero_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correo",
+              "displayName": "correo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono_contacto",
+              "displayName": "telefono_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional",
+              "displayName": "profesional",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_atencion",
+              "displayName": "tipo_atencion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mimetype",
+              "displayName": "mimetype",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "ca9e3eba-ed0c-4343-9226-7323995c67b4",
+      "name": "Revalidar horario",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        576,
+        -368
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Reglas_pago",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "40693af7-6819-4462-98f8-63242f9b947f",
+      "name": "Leer reglas de pago",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        800,
+        -368
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-5 + US-6 · Decide CÓMO se registra la solicitud, después de revalidar el horario y de leer las\n// reglas de pago. Entra: las filas de la pestaña Reglas_pago (nodo \"Leer reglas de pago\").\n// Usa también: \"Preparar solicitud\" (datos ya validados) y \"Revalidar horario\" (resultado de la verificación).\nconst p = $('Preparar solicitud').first().json;\nconst rv = $('Revalidar horario').first().json ?? {};\nconst norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim().replace(/\\s+/g, '_');\n\n// ---------- 1. Revalidación del horario (US-5) ----------\n// AC-2: si el horario dejó de estar disponible, NO se registra y se ofrecen otras opciones.\nif (rv.ok === true && rv.verificado === true && rv.disponible === false)\n  return [{ json: { ok: false, horario_no_disponible: true, opciones: rv.opciones ?? [],\n    mensaje: rv.mensaje ?? 'El horario elegido ya no está disponible. Ofrece otras opciones.' } }];\n\n// AC-3: si no se pudo verificar (error, agenda ilegible o no hay horario elegido), se registra\n// como PENDIENTE_VALIDACION: Erika revisa el horario y nunca se comunica como confirmado.\nconst verificado = rv.ok === true && rv.verificado === true && rv.disponible === true;\nconst estado = verificado ? 'PENDIENTE' : 'PENDIENTE_VALIDACION';\n\n// ---------- 2. Condiciones de pago (US-6) ----------\n// AC-1: se busca la regla del servicio y del tipo de atención en Reglas_pago.\n// AC-4: si no hay regla, o la regla no está CONFIRMADA por Salud Integral, NO se inventa nada:\n//       queda POR_CONFIRMAR y Erika decide.\nconst reglas = $input.all().map(x => x.json).filter(r => r && r.servicio);\nconst deServicio = reglas.filter(r => norm(r.servicio) === norm(p.servicio));\nconst regla = deServicio.find(r => norm(r.tipo_atencion) === p.tipo_atencion)\n  ?? deServicio.find(r => ['*', 'todas', 'todos'].includes(norm(r.tipo_atencion)));\n\nlet requiere_pago = 'POR_CONFIRMAR', estado_pago = 'POR_CONFIRMAR', valor_pago = '', instrucciones_pago = '';\nif (regla && norm(regla.estado_regla) === 'confirmada') {\n  const req = norm(regla.requiere_pago);\n  if (req === 'no') { requiere_pago = 'NO'; estado_pago = 'NO_APLICA'; }\n  else if (req === 'si' || req === 'sí') {\n    requiere_pago = 'SI';\n    estado_pago = 'PENDIENTE_RECIBO';           // AC-2: Erika debe generar el recibo\n    valor_pago = String(regla.valor ?? '').trim();\n    instrucciones_pago = String(regla.instrucciones ?? '').trim();\n  }\n}\n\nreturn [{ json: { ...p, ok: true, estado, horario_verificado: verificado ? 'SI' : 'NO',\n  requiere_pago, estado_pago, valor_pago, instrucciones_pago } }];\n"
+      },
+      "id": "19a726e9-41cf-4731-a090-8475b25f8193",
+      "name": "Decidir registro",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1024,
+        -368
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "9d7310f4-521c-4174-8f5d-b9d3c8164ac9",
+      "name": "¿Se puede registrar?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1248,
+        -368
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Devuelve al agente el aviso de horario no disponible con las nuevas opciones (US-5-AC-2).\nreturn [{ json: $input.first().json }];"
+      },
+      "id": "1d8e67a3-97b6-474e-81d6-ec295c5924b8",
+      "name": "Respuesta horario no disponible",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1472,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "telefono",
+              "lookupValue": "={{ $('Entrada herramienta').first().json.telefono }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d9995f7c-13da-4671-89d6-218e448ed7f8",
+      "name": "Buscar solicitudes del estudiante",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        32,
+        -736
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-6-AC-3 · El estudiante envió una foto o un PDF. ¿A qué solicitud con pago pendiente corresponde?\n// Entra: las solicitudes de ESTE número de WhatsApp (nodo \"Buscar solicitudes del estudiante\").\n// Se elige la más reciente que esté activa y esperando recibo o comprobante.\nconst ACTIVAS = ['PENDIENTE', 'PENDIENTE_VALIDACION', 'CONFIRMADA'];\nconst ESPERAN_COMPROBANTE = ['PENDIENTE_RECIBO', 'RECIBO_ENVIADO', 'COMPROBANTE_RECIBIDO', 'COMPROBANTE_RECHAZADO'];\nconst i = $('Entrada herramienta').first().json;\nconst tel = String(i.telefono ?? '').replace(/\\D/g, '');\nconst mayus = v => String(v ?? '').trim().toUpperCase();\n\nconst filas = $input.all().map(x => x.json)\n  .filter(f => f && f.id && String(f.telefono ?? '').replace(/\\D/g, '') === tel)   // doble control del número\n  .filter(f => ACTIVAS.includes(mayus(f.estado)) && ESPERAN_COMPROBANTE.includes(mayus(f.estado_pago)));\n\nif (!filas.length)\n  return [{ json: { ok: false, mensaje: 'Recibí tu archivo 📎, pero no tienes ningún pago pendiente en tus solicitudes. Si querías enviarme otra cosa, cuéntame por escrito qué necesitas.' } }];\n\n// La más reciente: la última fila de la hoja (row_number más alto).\nconst f = filas.sort((a, b) => (b.row_number ?? 0) - (a.row_number ?? 0))[0];\nreturn [{ json: {\n  ok: true,\n  id: f.id, nombre: f.nombre, codigo: f.codigo, numero_documento: f.numero_documento, servicio: f.servicio,\n  valor_pago: f.valor_pago ?? '', reenvio: mayus(f.estado_pago) === 'COMPROBANTE_RECIBIDO', estado_pago_anterior: mayus(f.estado_pago),\n  telefono: tel, message_id: i.message_id, tipo_archivo: i.mimetype || 'archivo',\n  fecha_comprobante: $now.setZone('America/Bogota').toFormat('dd/MM/yyyy HH:mm'),\n} }];\n"
+      },
+      "id": "838650d5-512d-48db-ae3a-0f4399566fd2",
+      "name": "Elegir solicitud del pago",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        -736
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.ok ? 0 : 1 }}"
+      },
+      "id": "1e79a6f0-791f-426a-a1b8-d34524ea7902",
+      "name": "¿Hay pago pendiente?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        480,
+        -736
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "=573234062106@s.whatsapp.net",
+        "messageText": "=🧾 *Comprobante recibido · {{ $json.id }}*\n\n*Nombre:* {{ $json.nombre }}\n*Código:* {{ $json.codigo }} · *Documento:* {{ $json.numero_documento }}\n*Servicio:* {{ $json.servicio }}\n*Archivo:* {{ $json.tipo_archivo }}{{ $json.reenvio ? ' (lo envió de nuevo)' : '' }}\n*WhatsApp:* +{{ $json.telefono }}\n\nEl archivo está en el chat de UnicaU con este estudiante. Después de revisarlo, en la hoja Solicitudes cambia estado_pago a PAGO_VALIDADO o a COMPROBANTE_RECHAZADO (y escribe el motivo en observaciones).​",
+        "options_message": {}
+      },
+      "id": "e9905411-b381-4a98-8f5e-d7218cc01bc3",
+      "name": "Avisar a Natalia: comprobante",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        704,
+        -800
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Elegir solicitud del pago').item.json.id }}",
+            "estado_pago": "COMPROBANTE_RECIBIDO",
+            "fecha_comprobante": "={{ $('Elegir solicitud del pago').item.json.fecha_comprobante }}",
+            "comprobante_ref": "={{ $('Elegir solicitud del pago').item.json.message_id }}",
+            "fecha_estado": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "estado_pago",
+              "displayName": "estado_pago",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_comprobante",
+              "displayName": "fecha_comprobante",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "comprobante_ref",
+              "displayName": "comprobante_ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_estado",
+              "displayName": "fecha_estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "573b72b5-3b0a-4ad8-8e49-0ac4323696fd",
+      "name": "Marcar comprobante recibido",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        928,
+        -800
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Respuesta al estudiante después de registrar el comprobante. Deja claro que RECIBIR no es VALIDAR (US-6-AC-3).\nconst s = $('Elegir solicitud del pago').first().json;\nreturn [{ json: { ok: true, id: s.id,\n  mensaje: `¡Recibí tu comprobante para la solicitud *${s.id}*! 🧾 Salud Integral lo revisará y validará el pago; te aviso por aquí apenas quede listo. Por ahora tu cita todavía no está confirmada.` } }];\n"
+      },
+      "id": "3e292abe-e221-4512-8be5-61a0aea689a3",
+      "name": "Respuesta comprobante",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        -800
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json }];"
+      },
+      "id": "f3cdbed5-5fb8-469d-aa04-811a86515966",
+      "name": "Respuesta sin pago pendiente",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        704,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Historial",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "fecha": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}",
+            "id": "={{ $('Decidir registro').item.json.id }}",
+            "campo": "estado",
+            "valor_anterior": "",
+            "valor_nuevo": "={{ $('Decidir registro').item.json.estado }}",
+            "actor": "UnicaU (bot)",
+            "origen": "WhatsApp",
+            "detalle": "=Solicitud creada · horario_verificado={{ $('Decidir registro').item.json.horario_verificado }} · requiere_pago={{ $('Decidir registro').item.json.requiere_pago }} · estado_pago={{ $('Decidir registro').item.json.estado_pago }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "fecha",
+              "displayName": "fecha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "campo",
+              "displayName": "campo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_anterior",
+              "displayName": "valor_anterior",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_nuevo",
+              "displayName": "valor_nuevo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actor",
+              "displayName": "actor",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "origen",
+              "displayName": "origen",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "detalle",
+              "displayName": "detalle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "ece947ea-7ba7-4480-adec-4190e6045eab",
+      "name": "Historial: solicitud creada",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1904,
+        -528
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Historial",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "fecha": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}",
+            "id": "={{ $('Validar cancelación').item.json.id }}",
+            "campo": "estado",
+            "valor_anterior": "={{ $('Validar cancelación').item.json.estado }}",
+            "valor_nuevo": "CANCELACION_SOLICITADA",
+            "actor": "UnicaU (bot)",
+            "origen": "WhatsApp",
+            "detalle": "=Motivo dado por el estudiante: {{ $('Entrada herramienta').first().json.motivo }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "fecha",
+              "displayName": "fecha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "campo",
+              "displayName": "campo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_anterior",
+              "displayName": "valor_anterior",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_nuevo",
+              "displayName": "valor_nuevo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actor",
+              "displayName": "actor",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "origen",
+              "displayName": "origen",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "detalle",
+              "displayName": "detalle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "43268904-5fd5-4668-b13a-fa964693fc15",
+      "name": "Historial: cancelación solicitada",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1392,
+        272
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Historial",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "fecha": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}",
+            "id": "={{ $('Elegir solicitud del pago').item.json.id }}",
+            "campo": "estado_pago",
+            "valor_anterior": "={{ $('Elegir solicitud del pago').item.json.estado_pago_anterior }}",
+            "valor_nuevo": "COMPROBANTE_RECIBIDO",
+            "actor": "UnicaU (bot)",
+            "origen": "WhatsApp",
+            "detalle": "=Comprobante {{ $('Elegir solicitud del pago').item.json.tipo_archivo }} · mensaje {{ $('Elegir solicitud del pago').item.json.message_id }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "fecha",
+              "displayName": "fecha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "campo",
+              "displayName": "campo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_anterior",
+              "displayName": "valor_anterior",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_nuevo",
+              "displayName": "valor_nuevo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actor",
+              "displayName": "actor",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "origen",
+              "displayName": "origen",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "detalle",
+              "displayName": "detalle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "a3fe4881-2127-4f15-8a1d-90e3ed0e228c",
+      "name": "Historial: comprobante recibido",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1152,
+        -800
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "telefono",
+              "lookupValue": "={{ $('Entrada herramienta').first().json.telefono }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d2c5e8d5-003b-46b0-baed-66b86ba5a94e",
+      "name": "Buscar mis solicitudes",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -64,
+        656
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-8 · Resume las solicitudes del estudiante en lenguaje claro, con un solo criterio para todo el bot.\n// AC-1: cada solicitud trae servicio, profesional, fecha y hora.\n// AC-2: distingue RECIBIDA (en revisión, sin pasos pendientes), PENDIENTE (falta algo: horario por\n//       verificar, pago, comprobante) y CONFIRMADA (asignada y con pago validado si aplica).\n// AC-3: nunca marca CONFIRMADA una cita con pago obligatorio sin validar.\n// Ahorro de tokens: el agente recibe ~8 campos por solicitud en vez de las ~40 columnas de la hoja.\nconst ZONA = 'America/Bogota';\nconst mayus = v => String(v ?? '').trim().toUpperCase();\nconst txt = v => String(v ?? '').trim();\nconst MAX_ACTIVAS = 5, MAX_CERRADAS = 3;\nconst FINALES = ['RECHAZADA', 'CANCELADA', 'CERRADA'];\n\nconst entrada = $input.all().map(x => x.json);\nif (entrada.some(f => f && f.error))\n  return [{ json: { ok: false, error_consulta: true,\n    mensaje: 'No fue posible consultar las solicitudes en este momento. Dilo con honestidad, no inventes estados y pide que lo intente de nuevo en unos minutos.' } }];\nconst filas = entrada.filter(f => f && txt(f.id));\n\nfunction fecha(v) {\n  if (v === '' || v == null) return null;\n  if (typeof v === 'number') return DateTime.fromObject({ year: 1899, month: 12, day: 30 }, { zone: ZONA }).plus({ days: Math.floor(v) });\n  for (const fmt of ['yyyy-MM-dd', 'dd/MM/yyyy', 'd/M/yyyy']) {\n    const d = DateTime.fromFormat(txt(v), fmt, { zone: ZONA });\n    if (d.isValid) return d;\n  }\n  return null;\n}\nfunction hora(v) {\n  if (v === '' || v == null) return '';\n  if (typeof v === 'number') { const m = Math.round((v % 1) * 1440); v = `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`; }\n  const m = txt(v).match(/^(\\d{1,2})(?::(\\d{2}))?/);\n  if (!m) return txt(v);\n  const h = +m[1], mi = m[2] ? +m[2] : 0;\n  const h12 = h % 12 === 0 ? 12 : h % 12;\n  return `${h12}:${String(mi).padStart(2, '0')} ${h < 12 ? 'a. m.' : 'p. m.'}`;\n}\nconst cuando = (f, h) => { const d = fecha(f); return d ? d.setLocale('es').toFormat(\"cccc d 'de' LLLL\") + (hora(h) ? `, ${hora(h)}` : '') : ''; };\n\n/** Estado para el estudiante: el mismo criterio que la hoja (US-7) y el motor de estados. */\nfunction estadoParaEstudiante(f) {\n  const e = mayus(f.estado), p = mayus(f.estado_pago), req = mayus(f.requiere_pago);\n  const pagoPendiente = req === 'SI' && p !== 'PAGO_VALIDADO';\n  const motivo = txt(f.motivo_estado);\n  if (e === 'CONFIRMADA' && !pagoPendiente)\n    return ['CONFIRMADA', 'Cita confirmada.', 'Asistir puntual. Si no puede ir, escribir CANCELAR.'];\n  if (e === 'CONFIRMADA')\n    return ['PENDIENTE', 'Tiene horario asignado, pero todavía NO está confirmada: falta validar el pago.', siguientePago(p, f)];\n  if (e === 'PENDIENTE' || e === 'PENDIENTE_VALIDACION') {\n    if (req === 'SI' || p === 'POR_CONFIRMAR' || req === 'POR_CONFIRMAR') {\n      const s = siguientePago(p, f);\n      if (s) return ['PENDIENTE', 'Solicitud en trámite: hay un paso de pago pendiente.', s];\n    }\n    if (e === 'PENDIENTE_VALIDACION')\n      return ['PENDIENTE', 'Solicitud recibida; el horario todavía está por verificar.', 'Salud Integral revisará la agenda y le avisará.'];\n    return ['RECIBIDA', 'Solicitud recibida y en revisión. Todavía no es una cita confirmada.', 'Salud Integral asignará el profesional y le confirmará por este chat.'];\n  }\n  if (e === 'CANCELACION_SOLICITADA') return ['CANCELACION_EN_TRAMITE', 'La cancelación está en trámite.', 'Salud Integral la confirmará.'];\n  if (e === 'CANCELADA') return ['CANCELADA', 'Solicitud cancelada' + (motivo ? `: ${motivo}` : '.'), 'Si necesita atención, puede hacer una solicitud nueva.'];\n  if (e === 'RECHAZADA') return ['RECHAZADA', 'Salud Integral no pudo aprobar la solicitud' + (motivo ? `: ${motivo}` : '.'), 'Puede hacer una solicitud nueva si lo necesita.'];\n  if (e === 'CERRADA') return ['CERRADA', 'La cita ya pasó y el proceso terminó.', ''];\n  return ['RECIBIDA', 'Solicitud en revisión.', 'Salud Integral le avisará por este chat.'];\n}\nfunction siguientePago(p, f) {\n  if (p === 'POR_CONFIRMAR' || p === '') return 'Salud Integral está definiendo si la atención tiene costo y le avisará.';\n  if (p === 'PENDIENTE_RECIBO') return 'Salud Integral generará el recibo y lo enviará a su correo.';\n  if (p === 'RECIBO_ENVIADO') return 'El recibo ya se envió a su correo. Cuando pague, enviar por este chat una foto o PDF del comprobante.';\n  if (p === 'COMPROBANTE_RECIBIDO') return 'Recibimos su comprobante; Salud Integral lo está revisando.';\n  if (p === 'COMPROBANTE_RECHAZADO') return 'El comprobante no se pudo validar' + (txt(f.observaciones) ? ` (${txt(f.observaciones)})` : '') + '. Enviar uno nuevo por este chat.';\n  if (p === 'PAGO_VALIDADO') return 'Pago validado; falta que Salud Integral asigne y confirme la cita.';\n  return '';\n}\n\nconst resumen = filas.map((f, idx) => {\n  const [categoria, estado_texto, siguiente_paso] = estadoParaEstudiante(f);\n  const confirmada = mayus(f.estado) === 'CONFIRMADA';\n  return {\n    orden: idx, id: txt(f.id), servicio: txt(f.servicio), categoria, estado_texto, siguiente_paso,\n    profesional: confirmada ? txt(f.profesional_asignado || f.profesional_solicitado) : txt(f.profesional_solicitado),\n    profesional_es: confirmada ? 'asignado' : 'solicitado',\n    cuando: confirmada ? cuando(f.fecha_cita, f.hora_cita) : cuando(f.fecha_solicitada, f.hora_solicitada),\n    cuando_es: confirmada ? 'cita' : 'horario solicitado',\n    final: FINALES.includes(mayus(f.estado)),\n  };\n});\nconst activas = resumen.filter(r => !r.final).sort((a, b) => b.orden - a.orden).slice(0, MAX_ACTIVAS);\nconst terminadas = resumen.filter(r => r.final).sort((a, b) => b.orden - a.orden).slice(0, MAX_CERRADAS);\nconst ultima = filas[filas.length - 1] || {};\nconst solicitudes = [...activas, ...terminadas].map(({ orden, final, ...r }) => r);\n\nreturn [{ json: {\n  ok: true,\n  total: filas.length,\n  solicitudes,\n  datos_estudiante: filas.length ? {\n    nombre: txt(ultima.nombre), codigo: txt(ultima.codigo), tipo_documento: txt(ultima.tipo_documento),\n    numero_documento: txt(ultima.numero_documento), edad: txt(ultima.edad), programa: txt(ultima.programa), facultad: txt(ultima.facultad), correo: txt(ultima.correo),\n  } : null,\n  mensaje: filas.length\n    ? 'Para informar el estado repite estado_texto y siguiente_paso de cada solicitud, con servicio, profesional y cuando. Solo di \"confirmada\" si categoria es CONFIRMADA.'\n    : 'No tiene solicitudes registradas con este número.',\n} }];\n"
+      },
+      "id": "6c72aa93-2b85-4f48-8b01-e0226798a4ea",
+      "name": "Resumir mis solicitudes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        176,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Borradores",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "telefono",
+              "lookupValue": "={{ $('Entrada herramienta').first().json.telefono }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "9f087acd-76ff-4641-9319-a111d1e8a72c",
+      "name": "Leer borrador",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        48,
+        -176
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Borradores",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "telefono": "={{ $('Entrada herramienta').first().json.telefono }}",
+            "datos": "={{ $('Preparar solicitud').first().json.borrador }}",
+            "actualizado": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}"
+          },
+          "matchingColumns": [
+            "telefono"
+          ],
+          "schema": [
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "datos",
+              "displayName": "datos",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actualizado",
+              "displayName": "actualizado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "648e6c4c-6286-4400-97f8-ff6c2b7885e6",
+      "name": "Guardar borrador",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        656,
+        -128
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Borradores",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "telefono": "={{ $('Entrada herramienta').first().json.telefono }}",
+            "datos": "",
+            "actualizado": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}"
+          },
+          "matchingColumns": [
+            "telefono"
+          ],
+          "schema": [
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "datos",
+              "displayName": "datos",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actualizado",
+              "displayName": "actualizado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "8e7f58e0-5a0e-477d-8b38-7b5d68e8397c",
+      "name": "Limpiar borrador",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2080,
+        -528
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-8-AC-3 / US-9-AC-2 / AC-4 · Guardar solicitud falló (salida de error): no hay código ni registro.\n// El borrador NO se limpia, así que el siguiente intento no vuelve a pedir los datos.\nreturn [{ json: { ok: false, error_registro: true,\n  mensaje: 'No fue posible guardar la solicitud por un problema técnico. NO digas que quedó registrada ni des un código. Explica que hubo un problema, que sus datos quedan guardados y que lo intente de nuevo en unos minutos.' } }];\n"
+      },
+      "id": "d3fdbd0f-bf2e-4020-bd9a-780784836803",
+      "name": "Respuesta registro fallido",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2112,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Borradores",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "telefono": "={{ $('Entrada herramienta').first().json.telefono }}",
+            "datos": "={{ $('Preparar solicitud').first().json.borrador }}",
+            "actualizado": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}"
+          },
+          "matchingColumns": [
+            "telefono"
+          ],
+          "schema": [
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "datos",
+              "displayName": "datos",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actualizado",
+              "displayName": "actualizado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "e549706a-05d9-4ad2-8e08-93bc866d3627",
+      "name": "Conservar borrador",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1904,
+        -304
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Config",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "clave",
+              "lookupValue": "solicitudes_id"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f00cf934-2552-4b21-8702-2d5678e94c51",
+      "name": "Hoja del mes",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -832,
+        -112
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "notes": "Lee en Config (Simulaciones Chat) el ID de la hoja de solicitudes del mes actual. El Apps Script lo cambia solo cada mes."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Devuelve los datos que llegaron a la herramienta (Hoja del mes solo sirve para saber qué hoja usar).\nreturn $('Entrada herramienta').all();"
+      },
+      "id": "f0d66f35-2043-4fcf-af05-52cfee66c586",
+      "name": "Seguir con la entrada",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -592,
+        -112
+      ]
+    }
+  ],
+  "pinData": {
+    "Entrada herramienta": [
+      {
+        "json": {
+          "accion": "horarios",
+          "servicio": "psicología",
+          "fecha_desde": "2026-11-12",
+          "profesional": "pedro"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Entrada herramienta": {
+      "main": [
+        [
+          {
+            "node": "Hoja del mes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Qué herramienta?": {
+      "main": [
+        [
+          {
+            "node": "Leer borrador",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Buscar solicitud",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Avisar a Natalia",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validar consulta",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Buscar solicitudes del estudiante",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Buscar mis solicitudes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar solicitud": {
+      "main": [
+        [
+          {
+            "node": "¿Registro válido?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardar solicitud": {
+      "main": [
+        [
+          {
+            "node": "Historial: solicitud creada",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Conservar borrador",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar solicitud": {
+      "main": [
+        [
+          {
+            "node": "Validar cancelación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar cancelación": {
+      "main": [
+        [
+          {
+            "node": "¿Se puede cancelar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Se puede cancelar?": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp a Natalia: cancelación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respuesta rechazo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Marcar cancelación": {
+      "main": [
+        [
+          {
+            "node": "Historial: cancelación solicitada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avisar a Natalia": {
+      "main": [
+        [
+          {
+            "node": "Respuesta escalar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp a Natalia: nueva solicitud": {
+      "main": [
+        [
+          {
+            "node": "Guardar solicitud",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp a Natalia: cancelación": {
+      "main": [
+        [
+          {
+            "node": "Marcar cancelación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Registro válido?": {
+      "main": [
+        [
+          {
+            "node": "Revalidar horario",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Guardar borrador",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar consulta": {
+      "main": [
+        [
+          {
+            "node": "¿Consulta válida?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Consulta válida?": {
+      "main": [
+        [
+          {
+            "node": "Leer configuración",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respuesta consulta inválida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer configuración": {
+      "main": [
+        [
+          {
+            "node": "Listar carpetas de años",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Elegir carpetas del año": {
+      "main": [
+        [
+          {
+            "node": "¿Hay agenda del año?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Hay agenda del año?": {
+      "main": [
+        [
+          {
+            "node": "Listar carpetas de meses",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respuesta consulta inválida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listar carpetas de meses": {
+      "main": [
+        [
+          {
+            "node": "Elegir carpetas del mes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Elegir carpetas del mes": {
+      "main": [
+        [
+          {
+            "node": "¿Hay agenda del mes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Hay agenda del mes?": {
+      "main": [
+        [
+          {
+            "node": "Listar carpetas de servicio",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respuesta consulta inválida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listar carpetas de servicio": {
+      "main": [
+        [
+          {
+            "node": "Elegir carpeta del servicio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Elegir carpeta del servicio": {
+      "main": [
+        [
+          {
+            "node": "¿Hay agenda del servicio?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Hay agenda del servicio?": {
+      "main": [
+        [
+          {
+            "node": "Buscar agendas del servicio",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respuesta consulta inválida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar agendas del servicio": {
+      "main": [
+        [
+          {
+            "node": "Descargar agenda",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Descargar agenda": {
+      "main": [
+        [
+          {
+            "node": "Preparar descompresión",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar descompresión": {
+      "main": [
+        [
+          {
+            "node": "Descomprimir xlsx",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Descomprimir xlsx": {
+      "main": [
+        [
+          {
+            "node": "Interpretar agenda",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listar carpetas de años": {
+      "main": [
+        [
+          {
+            "node": "Elegir carpetas del año",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpretar agenda": {
+      "main": [
+        [
+          {
+            "node": "Leer solicitudes activas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer solicitudes activas": {
+      "main": [
+        [
+          {
+            "node": "Armar respuesta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revalidar horario": {
+      "main": [
+        [
+          {
+            "node": "Leer reglas de pago",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer reglas de pago": {
+      "main": [
+        [
+          {
+            "node": "Decidir registro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decidir registro": {
+      "main": [
+        [
+          {
+            "node": "¿Se puede registrar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Se puede registrar?": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp a Natalia: nueva solicitud",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respuesta horario no disponible",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar solicitudes del estudiante": {
+      "main": [
+        [
+          {
+            "node": "Elegir solicitud del pago",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Elegir solicitud del pago": {
+      "main": [
+        [
+          {
+            "node": "¿Hay pago pendiente?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Hay pago pendiente?": {
+      "main": [
+        [
+          {
+            "node": "Avisar a Natalia: comprobante",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respuesta sin pago pendiente",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avisar a Natalia: comprobante": {
+      "main": [
+        [
+          {
+            "node": "Marcar comprobante recibido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Marcar comprobante recibido": {
+      "main": [
+        [
+          {
+            "node": "Historial: comprobante recibido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Historial: solicitud creada": {
+      "main": [
+        [
+          {
+            "node": "Limpiar borrador",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Historial: cancelación solicitada": {
+      "main": [
+        [
+          {
+            "node": "Respuesta cancelación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Historial: comprobante recibido": {
+      "main": [
+        [
+          {
+            "node": "Respuesta comprobante",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar mis solicitudes": {
+      "main": [
+        [
+          {
+            "node": "Resumir mis solicitudes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer borrador": {
+      "main": [
+        [
+          {
+            "node": "Preparar solicitud",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardar borrador": {
+      "main": [
+        [
+          {
+            "node": "Respuesta registro inválido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limpiar borrador": {
+      "main": [
+        [
+          {
+            "node": "Respuesta registrar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conservar borrador": {
+      "main": [
+        [
+          {
+            "node": "Respuesta registro fallido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hoja del mes": {
+      "main": [
+        [
+          {
+            "node": "Seguir con la entrada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Seguir con la entrada": {
+      "main": [
+        [
+          {
+            "node": "¿Qué herramienta?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "executionTimeout": 60
+  },
+  "versionId": "aabbd002-4b83-40a7-a044-f9c38db8eb44",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9cd8ef88dfd6559185ae60df03ae5890b0ce817a5691f8fd8d5c73b81fcc118b"
+  },
+  "id": "A4Pgkq5rbnBw26ef",
+  "tags": []
+}

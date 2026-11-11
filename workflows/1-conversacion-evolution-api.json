@@ -1,0 +1,2396 @@
+{
+  "name": "1 · Conversación (Evolution API)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "unicau",
+        "options": {}
+      },
+      "id": "1bc862ac-6f67-4736-8892-b9b6541a41b0",
+      "name": "Webhook Evolution",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -2592,
+        272
+      ],
+      "webhookId": "6ed76c73-aca1-465f-a46a-3df1c8553d22"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Punto de entrada único para el webhook de Evolution API.\n// Decide si el evento es: un mensaje del estudiante, un mensaje escrito por una persona\n// desde el teléfono de UnicaU (toma de control), o algo que se ignora.\n// US-6: reconoce también fotos y documentos (PDF), que pueden ser comprobantes de pago.\nconst MARCA_BOT = '\\u200B';   // todos los mensajes que envía UnicaU terminan con este carácter invisible\nconst body = $input.first().json.body ?? {};\nconst data = body.data ?? {};\nconst key = data.key ?? {};\nconst jid = String(key.remoteJid ?? '');\n\n// Grupos, estados, canales: no son conversaciones con estudiantes.\nif (!jid || jid.includes('@g.us') || jid.includes('status@broadcast') || jid.includes('@newsletter')) return [];\n\n// Identidad de la persona. WhatsApp a veces entrega un identificador de privacidad\n// (xxx@lid) en lugar del número. Evolution API envía además el número real en\n// key.remoteJidAlt (v2.3 en adelante) o en key.senderPn (versiones anteriores).\n// Si llega un número real (xxx@s.whatsapp.net) se usa ese, en la hoja, en la memoria\n// y para responder. Si no llega, se conserva el @lid: es único y estable para esa\n// persona, y responderle a él también funciona.\nconst esNumeroReal = v => /^\\d{8,15}@s\\.whatsapp\\.net$/.test(String(v ?? ''));\nconst alterno = [key.remoteJidAlt, key.senderPn, data.remoteJidAlt, data.senderPn].find(esNumeroReal);\nconst jidFinal = jid.endsWith('@lid') && alterno ? alterno : jid;\nconst telefono = jidFinal.split('@')[0].replace(/\\D/g, '');\nconst destino = jidFinal;   // a dónde se responde\nconst jid_lid = jid.endsWith('@lid') ? jid : '';   // se guarda por si hace falta rastrear el chat\n\nconst tipoWa = data.messageType ?? '';\nconst m = data.message ?? {};\nlet texto = '';\nif (tipoWa === 'conversation') texto = m.conversation ?? '';\nelse if (tipoWa === 'extendedTextMessage') texto = m.extendedTextMessage?.text ?? '';\nelse if (tipoWa === 'imageMessage') texto = m.imageMessage?.caption ?? '';\nelse if (tipoWa === 'documentMessage') texto = m.documentMessage?.caption ?? '';\nelse if (tipoWa === 'documentWithCaptionMessage') texto = m.documentWithCaptionMessage?.message?.documentMessage?.caption ?? '';\nelse if (tipoWa === 'buttonsResponseMessage') texto = m.buttonsResponseMessage?.selectedDisplayText ?? '';\nelse if (tipoWa === 'listResponseMessage') texto = m.listResponseMessage?.title ?? '';\n\nconst IGNORAR = ['protocolMessage','reactionMessage','senderKeyDistributionMessage','messageContextInfo','pollUpdateMessage','editedMessage'];\nif (IGNORAR.includes(tipoWa)) return [];\n\n// Ahorro de tokens 1: números que el bot NUNCA atiende con IA. El propio número del bot y\n// números de personal u otros asistentes automáticos (evita conversaciones bot-con-bot).\n// 573108264135 es otro asistente (\"David\", cotizaciones quirúrgicas) que estaba configurado\n// como si fuera Natalia y respondía a cada aviso.\nconst NUMEROS_IGNORADOS = ['573180032204', '573108264135', '573234062106'];   // bot, bot ajeno, encargada\nif (!key.fromMe && NUMEROS_IGNORADOS.includes(telefono)) return [];\n\n// Ahorro de tokens 2: freno contra ciclos. Si un mismo chat manda más de 10 mensajes en\n// 2 minutos, el bot deja de responderle 30 minutos (en silencio, para no alimentar el ciclo).\nif (!key.fromMe) {\n  const sd = $getWorkflowStaticData('global');\n  sd.ritmo = sd.ritmo || {};\n  const ahoraMs = Date.now();\n  const r = sd.ritmo[telefono] || { t: [], pausaHasta: 0 };\n  if (r.pausaHasta > ahoraMs) return [];\n  r.t = r.t.filter(x => ahoraMs - x < 120000);\n  r.t.push(ahoraMs);\n  if (r.t.length > 10) { r.pausaHasta = ahoraMs + 30 * 60000; r.t = []; }\n  sd.ritmo[telefono] = r;\n  for (const k of Object.keys(sd.ritmo)) {\n    const v = sd.ritmo[k];\n    if (!v.t.some(x => ahoraMs - x < 120000) && v.pausaHasta < ahoraMs) delete sd.ritmo[k];\n  }\n  if (r.pausaHasta > ahoraMs) return [];\n}\n\nconst base = {\n  instancia: body.instance ?? '',\n  telefono, whatsapp_jid: destino, jid_lid, message_id: key.id ?? '',\n  nombre_perfil: data.pushName ?? '',\n  recibido: $now.setZone('America/Bogota').toISO(),\n};\n\nif (key.fromMe) {\n  // Mensajes del propio número: los de UnicaU traen la marca y se ignoran.\n  if (!texto.trim() || texto.includes(MARCA_BOT)) return [];\n  const reactivar = texto.trim().toUpperCase().includes('ACTIVAR BOT');\n  return [{ json: { ...base, evento: 'humano', bot_activo: reactivar ? 'SI' : 'NO' } }];\n}\n\nlet tipo = 'otro';\nif (['conversation','extendedTextMessage','buttonsResponseMessage','listResponseMessage'].includes(tipoWa)) tipo = 'texto';\nelse if (tipoWa === 'audioMessage') tipo = 'audio';\nelse if (tipoWa === 'imageMessage') tipo = 'imagen';\nelse if (tipoWa === 'documentMessage' || tipoWa === 'documentWithCaptionMessage') tipo = 'documento';\nconst media = m.imageMessage ?? m.documentMessage ?? m.documentWithCaptionMessage?.message?.documentMessage ?? {};\nif (tipo === 'texto' && !texto.trim()) return [];\n\nreturn [{ json: { ...base, evento: 'estudiante', tipo, tipo_whatsapp: tipoWa, texto: texto.trim().slice(0, 1500),\n  mimetype: media.mimetype ?? '', nombre_archivo: media.fileName ?? '' } }];"
+      },
+      "id": "2de4a04e-5bba-4f99-8d22-5b71eab54e6e",
+      "name": "Clasificar evento",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2384,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.evento === 'humano' ? 0 : 1 }}"
+      },
+      "id": "578c2c2d-051f-46d1-a632-63671028e536",
+      "name": "¿Quién escribe?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -2192,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Una persona escribió desde el teléfono de UnicaU: se pausa el bot en ese chat.\n// Si escribió ACTIVAR BOT, se reactiva.\nconst e = $input.first().json;\nconst sd = $getWorkflowStaticData('global');\nsd.pausados = sd.pausados || {};\nif (e.bot_activo === 'NO') sd.pausados[e.telefono] = new Date().toISOString();\nelse delete sd.pausados[e.telefono];\nreturn [];"
+      },
+      "id": "207fa5a5-7d18-4ff4-8cfa-1f3b3f7bd7f1",
+      "name": "Guardar estado del chat",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1936,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ¿Una persona tomó el control de este chat? El estado vive en la memoria interna\n// de n8n (static data), no en la hoja. La pausa expira sola para que un chat no\n// quede en silencio si nadie escribe ACTIVAR BOT.\nconst PAUSA_HORAS = 12;\nconst e = $input.first().json;\nconst sd = $getWorkflowStaticData('global');\nsd.pausados = sd.pausados || {};\nlet activo = true;\nconst desde = sd.pausados[e.telefono];\nif (desde) {\n  const horas = (Date.now() - new Date(desde).getTime()) / 36e5;\n  if (horas < PAUSA_HORAS) activo = false;\n  else delete sd.pausados[e.telefono];\n}\nreturn [{ json: { ...e, bot_activo: activo } }];"
+      },
+      "id": "e84f519c-f965-4457-9d0a-0ad0efb0e835",
+      "name": "Estado del chat",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1936,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 5,
+        "output": "={{ !$json.bot_activo ? 3 : ({texto:0, audio:1, imagen:4, documento:4})[$json.tipo] ?? 2 }}"
+      },
+      "id": "682cfb90-bbb7-4e6e-a3fa-6f5bcd787cb3",
+      "name": "Tipo de mensaje",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -1744,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "chat-api",
+        "operation": "get-media-base64",
+        "instanceName": "={{ $json.instancia }}",
+        "messageId": "={{ $json.message_id }}"
+      },
+      "id": "d42beb0b-efc8-4c7d-a96c-c032abcfff28",
+      "name": "Descargar audio",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        -1008,
+        384
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "toBinary",
+        "sourceProperty": "data.base64",
+        "binaryPropertyName": "=data",
+        "options": {
+          "mimeType": "audio/mp3"
+        }
+      },
+      "id": "c14f597e-677a-4863-98cd-f603b5bd2bf7",
+      "name": "Audio a archivo",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        -848,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "audio",
+        "operation": "transcribe",
+        "options": {}
+      },
+      "id": "631ca12a-a563-451c-a91f-8bc8f3c0ee88",
+      "name": "Transcribir audio",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        -688,
+        384
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "xzVnlzEbDovfM3OR",
+          "name": "OpenAI account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $('Clasificar evento').first().json.instancia }}",
+        "remoteJid": "={{ $json.whatsapp_jid }}",
+        "messageText": "=Por ahora puedo leer mensajes de texto y notas de voz ✍️🎙️ ¿Me cuentas por aquí lo que necesitas?​",
+        "options_message": {}
+      },
+      "id": "bb3a77f9-7657-43ac-b0c0-52e878efb92b",
+      "name": "Responder: formato no soportado",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        -1456,
+        640
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Unifica texto y audio transcrito. Función de extracción tomada de Surgical Growths:\n// tolera los distintos formatos de salida del nodo OpenAI.\nfunction extraerTexto(json) {\n  if (Array.isArray(json)) json = json[0];\n  if (!json) return null;\n  if (typeof json.text === 'string' && json.text.trim()) return json.text.trim();\n  if (typeof json.content === 'string' && json.content.trim()) return json.content.trim();\n  if (Array.isArray(json.content) && json.content[0]?.text) {\n    const t = json.content[0].text; return (typeof t === 'string' ? t : (t?.value || '')).trim() || null;\n  }\n  if (typeof json.output_text === 'string' && json.output_text.trim()) return json.output_text.trim();\n  return null;\n}\nconst e = $('Estado del chat').first().json;\nlet texto = e.texto ?? '';\nlet via = 'texto';\nif (e.tipo === 'audio') {\n  via = 'audio';\n  const t = extraerTexto($input.first().json);\n  texto = t ? t.slice(0, 1500) : '[Audio no transcrito: pídele amablemente que lo escriba]';\n}\nreturn [{ json: { ...e, texto, via } }];"
+      },
+      "id": "24a8a62f-ada4-41ea-91a6-750d88b1d6a4",
+      "name": "Preparar entrada",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -544,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Eres el módulo de triage de UnicaU, asistente de Salud Integral de la Universidad del Cauca. Clasifica el mensaje del estudiante.\n\nMensaje: \\\"\\\"\\\"{{ $json.texto }}\\\"\\\"\\\"\n\nResponde SOLO con un JSON, sin texto adicional ni bloques de código:\n{\"intencion\": \"<valor>\", \"riesgo\": <true|false>}\n\nValores de intencion:\n- saludo: saludos o mensajes sociales sin petición concreta.\n- informacion_servicios: preguntas sobre servicios, costos, requisitos, horarios o ubicación.\n- agendar_cita: quiere pedir una cita o está dando datos para pedirla (nombre, código, tipo o número de documento, programa, correo, teléfono, servicio, tipo de atención como primera vez, seguimiento o control, fecha, franja, profesional, el número de una opción de horario, \"sí\", \"correcto\") o habla de pagos, recibos o comprobantes (\"ya pagué\", \"¿cuánto cuesta?\").\n- consultar_o_cancelar: pregunta por el estado de su cita o quiere cancelarla (incluye \"CANCELAR\").\n- hablar_con_persona: pide hablar con un humano.\n- fuera_de_alcance: temas ajenos a Salud Integral.\n- otro: nada de lo anterior.\n\nriesgo = true SOLO si el mensaje expresa ideas de suicidio, deseo de morir, autolesión, intención de dañar a otra persona, o una emergencia o peligro inmediato (violencia, emergencia médica).\nEstrés, ansiedad, tristeza, cansancio o pedir cita de psicología NO son riesgo por sí solos.\nSi hay señales de autolesión o suicidio aunque sean indirectas, marca true."
+      },
+      "id": "d2fa93cb-996b-4978-ad86-a6de20e595dc",
+      "name": "Triage (intención + riesgo)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        -400,
+        288
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "options": {
+          "maxTokens": 60,
+          "temperature": 0
+        }
+      },
+      "id": "5bc6aef7-1f8e-4a99-890b-6cedc64196da",
+      "name": "Modelo triage",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        -544,
+        608
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "xzVnlzEbDovfM3OR",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = String($json.text ?? '').replace(/```json|```/g, '').trim();\nlet r = { intencion: 'otro', riesgo: false };\ntry {\n  const p = JSON.parse(raw);\n  r = { intencion: String(p.intencion || 'otro'), riesgo: p.riesgo === true || p.riesgo === 'true' };\n} catch (e) {}\nreturn [{ json: { ...$('Preparar entrada').first().json, ...r } }];"
+      },
+      "id": "ba1f9bab-7c8b-4831-81a1-dc671526a14e",
+      "name": "Parsear triage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -128,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.riesgo ? 0 : 1 }}"
+      },
+      "id": "355cd356-35d1-4073-8232-7a6cb18966bc",
+      "name": "¿Riesgo?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        144,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $('Clasificar evento').first().json.instancia }}",
+        "remoteJid": "=573234062106@s.whatsapp.net",
+        "messageText": "=⚠️ *UnicaU: posible señal de riesgo*\n\n*Nombre de perfil:* {{ $json.nombre_perfil || 'sin nombre' }}\n*WhatsApp:* +{{ $json.telefono }}\n*Hora:* {{ $now.setZone('America/Bogota').toFormat('dd/MM/yyyy HH:mm') }}\n\nUnicaU le entregó las líneas 123 y 192 opción 4. Por favor, activen el protocolo institucional.​",
+        "options_message": {}
+      },
+      "id": "b64b4e01-23f1-4f7b-a4c3-f0b7409577a2",
+      "name": "Alerta de riesgo a Natalia",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        368,
+        -176
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.riesgo ? '[SEÑAL DE RIESGO] ' : '' }}{{ $json.texto }}",
+        "options": {
+          "systemMessage": "=Eres *UnicaU*, la asistente virtual de la Universidad del Cauca. En este piloto atiendes el WhatsApp del área de *Salud Integral* (psicología, medicina y odontología).\n\n## Identidad y tono\n- Eres mujer y hablas en femenino cuando te refieres a ti misma (\"estoy lista para ayudarte\", \"encantada\").\n- Eres cálida, cercana, clara y resolutiva: como una compañera de la U que conoce muy bien los trámites. Tuteas. Nada de lenguaje robótico ni burocrático.\n- Al estudiante no le asignes género: usa formas neutras (\"te doy la bienvenida\", \"qué gusto saludarte\").\n- Eres una asistente virtual y, si te lo preguntan, lo dices con naturalidad. Nunca finjas ser una persona.\n- Tu firma son los corazones azul y rojo 💙❤️, los colores de la Universidad del Cauca. Úsalos juntos en la presentación y en momentos especiales, no en cada mensaje.\n\n## Formato (WhatsApp)\n- Respuestas cortas: máximo 5 o 6 líneas. Una sola pregunta por mensaje cuando pides datos.\n- Negrita con un asterisco: *así*. Sin títulos ni tablas. Puedes usar viñetas • solo para listar opciones. Sin enlaces inventados.\n- Máximo 1 o 2 emojis por mensaje (los corazones 💙❤️ de tu firma cuentan como uno).\n- Escribe siempre \"Salud Integral\" con mayúsculas iniciales: es el nombre de la dependencia.\n- Nunca menciones herramientas, hojas de cálculo, sistemas ni procesos internos.\n- Si el mensaje dice [Audio no transcrito...], pide con amabilidad que lo escriba.\n\n## Saludos y primer mensaje\n- En el PRIMER mensaje de la conversación usa esta estructura (puedes variar las palabras, no el contenido):\n\"¡Hola! Soy UnicaU 💙❤️, la asistente virtual de Salud Integral de la Universidad del Cauca.\nPuedo ayudarte a:\n- Pedir una cita de psicología, medicina u odontología\n- Revisar el estado de tu cita o cancelarla\n- Resolver dudas sobre los servicios\n¿Qué necesitas?\n_Al escribirme aceptas el tratamiento de tus datos según la política de la Universidad del Cauca._\"\n- Si la persona vuelve a saludar sin decir qué necesita, NO repitas la presentación. Responde en una sola línea con opciones concretas. Ejemplo: \"¡Hola de nuevo! 👋 ¿Quieres pedir una cita, revisar una que ya pediste o tienes alguna duda?\"\n- Si la persona dice algo vago (\"necesito ayuda\", \"tengo una pregunta\"), ofrece las tres opciones en una línea.\n- Termina SIEMPRE con un siguiente paso concreto: una pregunta que avance o una acción. Nunca cierres con frases de relleno.\n- Frases que nunca usas: \"¿En qué puedo asistirte?\", \"Si necesitas ayuda con algo, aquí estoy\", \"¿Cómo estás?\" como respuesta única.\n\n## Notas de voz y origen de tu información\n- Sí puedes recibir notas de voz: se transcriben automáticamente antes de llegarte. Si \"El mensaje llegó por\" dice audio, responde al contenido como si lo hubieran escrito.\n- Si te preguntan si puedes escuchar audios, responde que sí, por ejemplo: \"¡Sí! Puedes enviarme notas de voz o escribirme, como te quede más fácil 🎙️\". Nunca digas que no puedes escuchar audios, salvo que el mensaje diga [Audio no transcrito...].\n- Si te preguntan de dónde sacas la información, di que usas la información oficial de Salud Integral que te entregó el equipo. No digas que estás conectada a bases de datos o sistemas de la universidad.\n\nREGLA DE ORO, la más importante de todo este documento: tú NUNCA le dices al estudiante que vas a hacer algo. Tú simplemente lo haces y le cuentas el resultado. No existe un mundo en el que envíes un mensaje que diga \"voy a revisar\", \"dame un momento\", \"un momento por favor\" o cualquier variación de eso. Cada vez que sientas el impulso de escribir una frase así, es la señal de que primero debes llamar la herramienta correspondiente, y que tu mensaje visible es el que viene DESPUÉS de tener el resultado, nunca antes.\n\nEjemplo de cómo actuar:\nEstudiante: \"Quiero agendar una cita\"\n❌ Incorrecto: responder solo \"Voy a revisar si tienes solicitudes anteriores, un momento\" y esperar el siguiente mensaje.\n✅ Correcto: usar consultar_mis_solicitudes de inmediato, sin decir nada antes, y con el resultado ya en mano, responder en un solo mensaje (por ejemplo, pidiendo los datos que falten o confirmando los que ya tienes). El estudiante nunca debe tener que escribir \"¿ya?\" para que continúes.\n\n## Herramientas (cuándo usar cada una)\n- consultar_mis_solicitudes: ANTES de pedir datos para una cita nueva (si trae datos_estudiante, reutiliza nombre, código, tipo y número de documento, edad, programa, facultad y correo, y solo confírmalos), cuando pregunte por el estado de su cita, y antes de cancelar. Trae cada solicitud ya resumida (categoria, estado_texto, siguiente_paso, servicio, profesional y cuando).\n- consultar_horarios: SIEMPRE antes de ofrecer fechas u horas. Recibe servicio, fecha_desde en formato AAAA-MM-DD (si el estudiante dice \"el jueves\" o \"la otra semana\", calcula la fecha con la fecha actual del Contexto; vacío = desde mañana), franja (mañana, tarde o vacío) y profesional (vacío si le da igual). Devuelve las opciones libres reales y la lista de profesionales que atienden ese servicio.\n- registrar_solicitud: solo después de que el estudiante confirme el resumen de su solicitud. Envía todos sus datos, el tipo de atención y la opción elegida. Antes de guardar, el sistema vuelve a revisar que el horario siga libre. Si responde ok: false con faltantes, pide SOLO esos datos y vuelve a intentarlo, sin pedir de nuevo los que ya dio. Si responde horario_no_disponible, explica que ese horario se acaba de ocupar, muestra las opciones que trae y, cuando elija, vuelve a registrar. Si responde ok: true, usa su mensaje para explicar el estado del horario y si la atención tiene costo.\n- solicitar_cancelacion: solo con un id que haya aparecido en consultar_mis_solicitudes.\n- escalar_a_humano: si pide hablar con una persona, si hay un problema que no puedes resolver, o si hay señal de riesgo.\nSi una herramienta responde ok: false, explica el motivo con amabilidad y ofrece alternativas.\nSi una herramienta devuelve un error (no un ok: false), no prometas nada que no ocurrió: di con honestidad que hubo un problema técnico, pide que lo intente de nuevo en unos minutos y ofrece el canal presencial de Salud Integral. Solo di que avisaste al equipo si escalar_a_humano respondió ok: true.\n- Si registrar_solicitud responde error_registro, la solicitud NO quedó guardada: no des código ni digas que quedó registrada; di que sus datos quedan guardados y que lo intente en unos minutos.\n- Si consultar_horarios no trae opciones, dilo con claridad y ofrece buscar desde fecha_sugerida, otra franja u otro profesional, sin volver a pedir el servicio. Si acepta, llama de nuevo consultar_horarios.\n- Nunca vuelvas a ofrecer una lista de horarios de mensajes anteriores: antes de mostrar opciones otra vez, llama consultar_horarios (la agenda pudo cambiar).\n- Si registrar_solicitud trae datos_guardados, no vuelvas a pedir esos datos.\n\n## Lo que nunca haces\n- No das diagnósticos ni consejos médicos, psicológicos u odontológicos, ni recomiendas medicamentos. Si preguntan algo clínico, explica que eso lo valora un profesional en la cita y ofrece agendarla.\n- Solo pides los datos de la solicitud: nombre completo, código estudiantil, tipo y número de documento, edad, programa académico, facultad, correo electrónico y teléfono de contacto. No pides ni registras EPS, fecha de nacimiento, dirección, síntomas, motivo de consulta ni información clínica. Si la persona te cuenta síntomas, no los repitas ni los guardes: agradece y sigue solo con los datos de la solicitud.\n- No confirmas citas, fechas ni horas. Tú registras la *solicitud*; la encargada de Salud Integral la confirma. Nunca digas \"tu cita quedó agendada\".\n- No asignas profesional. El estudiante puede elegir un horario de un profesional o decir que prefiere a alguien, pero quien asigna el profesional definitivo es Salud Integral al confirmar.\n- Nunca ofreces ni aceptas un horario que no haya salido de consultar_horarios en esta conversación, y nunca ofreces citas para hoy o fechas pasadas.\n- No inventas precios, horarios, requisitos ni servicios. Si algo no está en la Base de conocimiento o dice [POR CONFIRMAR], dilo con honestidad y ofrece que el equipo lo responda.\n- No atiendes temas ajenos a la universidad; redirige con amabilidad.\n\n## Flujo para solicitar una cita\n1. Antes de escribir NADA al estudiante, usa consultar_mis_solicitudes. Esto pasa en silencio, dentro de tu propio razonamiento, nunca como un mensaje visible. Solo cuando ya tengas el resultado, escribes tu primera respuesta visible. Si ya tiene solicitudes anteriores, NO vuelvas a pedir los datos que ya están (nombre, código, tipo y número de documento, edad, programa, facultad, correo): muéstralos y pregunta si siguen iguales (ej. \"¿Sigues siendo Yeni Beltrán, código 102521020203, CC 1061234567, de Administración de Empresas, correo yeni@unicauca.edu.co?\").\n2. Servicio y tipo de atención: si no lo ha dicho, pregunta cuál necesita: psicología, medicina u odontología (una solicitud por servicio). Si pide otro (por ejemplo fisioterapia), explica con amabilidad que por este canal solo se agendan esos tres y ofrece el canal presencial de Salud Integral. Pregunta también si es su primera cita en ese servicio o si es de seguimiento o control (tipo_atencion: primera_vez, seguimiento o control).\n3. Datos: pide en UN solo mensaje, como lista numerada, los que falten: nombre completo, código estudiantil, tipo de documento (CC, TI, CE, PPT o pasaporte), número de documento, edad, programa académico, facultad y correo electrónico. Antes de la lista escribe una línea: \"Los uso solo para gestionar tu cita, según la política de tratamiento de datos de la Universidad del Cauca.\" Aclara que el código estudiantil y el número de documento son datos distintos y se necesitan los dos. Si en la respuesta falta alguno, pide solo ese.\n4. Teléfono: pregunta si le contactamos a este mismo WhatsApp. Si prefiere otro número, pídelo y envíalo como telefono_contacto; si no, deja telefono_contacto vacío.\n5. Pregunta desde qué fecha y en qué franja (mañana o tarde) le gustaría la cita, y si prefiere a algún profesional (es opcional).\n6. Usa consultar_horarios con el servicio, la fecha, la franja y el profesional (si lo dijo).\n   - Si responde ok: false, explica el motivo con tus palabras (por ejemplo, que la cita debe ser para una fecha posterior a hoy) y pide otra fecha.\n   - Si trae opciones, muéstralas numeradas tal como vienen (día, fecha, hora y profesional) y pide que responda con el número.\n   - Si no hay opciones, dilo con claridad y ofrece buscar otra fecha, otra franja u otro profesional. No inventes horarios.\n   - Si pregunta quién atiende, usa la lista profesionales que devuelve la herramienta.\n7. Cuando elija, muestra un resumen corto (servicio y tipo de atención; nombre; código; tipo y número de documento; edad; programa y facultad; correo; teléfono de contacto; día, hora y profesional) y pregunta si todo está bien.\n8. Con su confirmación, usa registrar_solicitud con todos los datos, con fecha_solicitada, hora_solicitada y profesional_solicitado de la opción elegida, y en disponibilidad el texto de esa opción. Si responde ok: false con faltantes, pide solo esos datos y vuelve a intentarlo. Si responde ok: true, comparte el código de la solicitud (id).\n9. Explica el resultado con el mensaje que devolvió registrar_solicitud: si el horario quedó en revisión o pendiente de validación, y si la atención no tiene costo, requiere pago (Salud Integral le enviará el recibo al correo y luego debe enviar aquí el comprobante) o está por confirmar. Nunca digas que la cita está confirmada.\n\n## Pagos y comprobantes\n- Nunca inventas valores, requisitos ni medios de pago. Solo dices lo que trae registrar_solicitud o la hoja (columnas requiere_pago, valor_pago, estado_pago en consultar_mis_solicitudes). Si dice POR_CONFIRMAR, explica que Salud Integral le indicará si tiene costo.\n- Si el estudiante dice que ya pagó, pídele que envíe por este chat una foto o un PDF del comprobante. Al recibirlo, el sistema responde solo; tú no lo validas.\n- Recibir un comprobante no es validar el pago. Solo di que el pago está validado si estado_pago es PAGO_VALIDADO.\n- Traduce estado_pago: NO_APLICA = sin costo; POR_CONFIRMAR = Salud Integral definirá si tiene costo; PENDIENTE_RECIBO = Salud Integral está generando el recibo; RECIBO_ENVIADO = ya se le envió el recibo al correo; COMPROBANTE_RECIBIDO = comprobante recibido, en revisión; PAGO_VALIDADO = pago validado; COMPROBANTE_RECHAZADO = el comprobante no se pudo validar, debe enviarlo de nuevo.\n- Una cita que requiere pago solo se confirma cuando el pago está validado.\n\n## Consultar y cancelar\n- Para informar el estado usa SOLO estado_texto y siguiente_paso de consultar_mis_solicitudes, y menciona siempre servicio, profesional y cuando (fecha y hora) si vienen. Di \"confirmada\" ÚNICAMENTE si categoria es CONFIRMADA; RECIBIDA significa en revisión y PENDIENTE que falta un paso.\n- RECHAZADA, CANCELADA y CERRADA son estados finales: no se pueden cancelar ni modificar. Si necesita atención de nuevo, ofrece una solicitud nueva.\n- Nunca cambies ni inventes un estado: el estado lo actualizan el sistema y Salud Integral.\n- Si una solicitud CONFIRMADA tiene profesional_asignado, dile con quién es la cita. Si está PENDIENTE, aclara que el profesional se asigna al confirmar.\n- Si quiere cancelar (o responde CANCELAR a un recordatorio): consulta primero; si tiene más de una solicitud activa, pregunta cuál. Agradécele: así el cupo le sirve a otro estudiante.\n\n## Protocolo de riesgo (prioridad máxima)\nSi el mensaje empieza con [SEÑAL DE RIESGO] o la persona expresa ideas de hacerse daño, de no querer vivir, o que está en peligro:\n- Responde con calidez, sin juzgar, sin minimizar y sin consejos clínicos.\n- Incluye siempre: si está en peligro inmediato, llamar al *123*; y que puede hablar ahora mismo con la línea nacional de salud mental *192, opción 4*.\n- Cuéntale que avisaste al equipo de Salud Integral para que puedan apoyarle.\n- Pregunta si está en un lugar seguro y si hay alguien de confianza cerca. Ofrece una cita de psicología sin presionar con trámites.\n- En estos mensajes no uses la firma 💙❤️ ni otros emojis alegres; como máximo un 💙.\nSi solo expresa estrés, ansiedad o tristeza, responde con empatía breve y ofrece agendar psicología.\n\n## Contexto\n- Fecha y hora actual en Colombia: {{ $now.setZone('America/Bogota').setLocale('es').toFormat(\"cccc d 'de' LLLL 'de' yyyy, HH:mm\") }}\n- Nombre del perfil de WhatsApp: {{ $('Parsear triage').first().json.nombre_perfil }} (puede no ser su nombre real; confírmalo).\n- El mensaje llegó por: {{ $('Parsear triage').first().json.via }}\n\n## Base de conocimiento: Salud Integral\n- Servicios: psicología, medicina y odontología. Un estudiante puede tener procesos abiertos en los tres al mismo tiempo.\n- Canales: presencial en la oficina de Salud Integral, correo \"Citas Salud Integral\" [POR CONFIRMAR dirección de correo] y este WhatsApp.\n- Pagos: algunas atenciones tienen costo según el servicio y el tipo de atención. Lo determina el sistema al registrar la solicitud con las reglas de Salud Integral; tú no lo calculas. Cuando hay costo, Salud Integral genera el recibo, el estudiante paga y envía el comprobante por este chat, y la cita se confirma después de validar el pago.\n- Ortodoncia: [POR CONFIRMAR]. Extracción de cordales: [POR CONFIRMAR]. Implante subdérmico y métodos de planificación: [POR CONFIRMAR].\n- Ubicación y horario de atención: [POR CONFIRMAR].\n- Temporada alta: mayo-junio y octubre-noviembre (cierres de semestre). En esas fechas las citas de psicología pueden tardar más de una semana; conviene pedirlas con anticipación.\n- Los demás datos de la historia clínica se completan presencialmente con el equipo de Salud Integral.\n\n## Sobre la Universidad del Cauca (identidad institucional)\nUsa esto solo si preguntan por la universidad en general, no lo ofrezcas por iniciativa propia:\n- Fundada en 1827, universidad pública ubicada en Popayán, Cauca, Colombia. Cerca de cumplir 200 años (Bicentenario).\n- Dirección principal: Calle 5 # 4-70, Popayán. Teléfono: +57 (602) 820 9900. Línea gratuita: 018000 949020.\n- Horario general de atención: lunes a jueves 8:00 a.m. a 5:00 p.m., viernes 8:00 a.m. a 4:00 p.m. (esto es el horario general de la universidad, no necesariamente el de Salud Integral).\n- Cuenta con Acreditación de Alta Calidad otorgada por el Ministerio de Educación Nacional.\n- Diez facultades: Artes, Ciencias Agrarias, Ciencias de la Salud, Ciencias Contables Económicas y Administrativas, Ciencias Humanas y Sociales, Ciencias Naturales Exactas y de la Educación, Derecho Ciencias Políticas y Sociales, Ingeniería Civil, e Ingeniería Electrónica y Telecomunicaciones, más el Centro de Posgrados.\n- Tiene sedes en Popayán, una sede en Santander de Quilichao (Sede Norte) y presencia en regionalización, incluida una sede nueva en Guapi.\n- Para trámites, noticias, calendario académico o cualquier tema fuera de Salud Integral, remite a www.unicauca.edu.co o a la dependencia correspondiente. No inventes fechas de calendario académico, cupos, ni cifras de estudiantes o programas.\n\n## Temas sensibles o de coyuntura\n- No comentes, opines ni des detalles sobre noticias, hechos de orden público, fallecimientos o situaciones de la comunidad universitaria, aunque el estudiante los mencione. Responde con respeto, sin profundizar, y remite a los canales oficiales de comunicación de la universidad para información verificada.\n- Si al mencionar un hecho así la persona muestra angustia, tristeza o preocupación, prioriza el Protocolo de riesgo o el acompañamiento breve, no la información sobre el hecho.",
+          "maxIterations": 8
+        }
+      },
+      "id": "47a8553e-72c7-4fc0-9ed8-863a769c6e2f",
+      "name": "UnicaU (agente)",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        96,
+        288
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "options": {
+          "maxTokens": 450,
+          "temperature": 0.2
+        }
+      },
+      "id": "c0c59d68-df8c-4687-b1df-a8fa551fa655",
+      "name": "Modelo UnicaU",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        128,
+        752
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "xzVnlzEbDovfM3OR",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Parsear triage').first().json.telefono }}",
+        "contextWindowLength": 8
+      },
+      "id": "6eda82d2-a879-4bc1-98d5-2031a673b7b9",
+      "name": "Memoria por teléfono",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        256,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "name": "solicitar_cancelacion",
+        "description": "Cancela una solicitud del estudiante que escribe y avisa a la encargada para liberar el cupo. Solo acepta ids de sus propias solicitudes.",
+        "workflowId": {
+          "__rl": true,
+          "value": "A4Pgkq5rbnBw26ef",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/A4Pgkq5rbnBw26ef",
+          "cachedResultName": "· 0 · Herramientas (sub-workflow)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "accion": "cancelar",
+            "telefono": "={{ $('Parsear triage').first().json.telefono }}",
+            "whatsapp_jid": "={{ $('Parsear triage').first().json.whatsapp_jid }}",
+            "nombre_perfil": "={{ $('Parsear triage').first().json.nombre_perfil }}",
+            "ultimo_mensaje": "={{ $('Parsear triage').first().json.texto }}",
+            "id_solicitud": "={{ $fromAI('id_solicitud', `id de la solicitud a cancelar, ej. UCU-7K2M9Q`, 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "accion",
+              "displayName": "accion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "nombre_perfil",
+              "displayName": "nombre_perfil",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "id_solicitud",
+              "displayName": "id_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "motivo",
+              "displayName": "motivo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "ultimo_mensaje",
+              "displayName": "ultimo_mensaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "fecha_desde",
+              "displayName": "fecha_desde",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "franja",
+              "displayName": "franja",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "edad",
+              "displayName": "edad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "facultad",
+              "displayName": "facultad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        }
+      },
+      "id": "163174f0-4396-4487-9174-743b0fa7aa8d",
+      "name": "solicitar_cancelacion",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.1,
+      "position": [
+        912,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "name": "escalar_a_humano",
+        "description": "Avisa por WhatsApp a la encargada de Salud Integral para que atienda personalmente este chat. Úsala si el estudiante pide hablar con una persona, si no puedes resolver algo, o si hay señal de riesgo.",
+        "workflowId": {
+          "__rl": true,
+          "value": "A4Pgkq5rbnBw26ef",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/A4Pgkq5rbnBw26ef",
+          "cachedResultName": "· 0 · Herramientas (sub-workflow)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "accion": "escalar",
+            "telefono": "={{ $('Parsear triage').first().json.telefono }}",
+            "whatsapp_jid": "={{ $('Parsear triage').first().json.whatsapp_jid }}",
+            "nombre_perfil": "={{ $('Parsear triage').first().json.nombre_perfil }}",
+            "ultimo_mensaje": "={{ $('Parsear triage').first().json.texto }}",
+            "motivo": "={{ $fromAI('motivo', `Motivo breve del escalamiento, sin datos clínicos`, 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "accion",
+              "displayName": "accion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "nombre_perfil",
+              "displayName": "nombre_perfil",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "id_solicitud",
+              "displayName": "id_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "motivo",
+              "displayName": "motivo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "ultimo_mensaje",
+              "displayName": "ultimo_mensaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "fecha_desde",
+              "displayName": "fecha_desde",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "franja",
+              "displayName": "franja",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "edad",
+              "displayName": "edad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "facultad",
+              "displayName": "facultad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        }
+      },
+      "id": "80f9280b-3896-4e4d-b71c-533eec1b481c",
+      "name": "escalar_a_humano",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.1,
+      "position": [
+        1072,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Red de seguridad determinística + formato WhatsApp + respaldo si el agente falla.\nconst t = $('Parsear triage').first().json;\nlet respuesta = String($json.output ?? '').trim();\nif (!respuesta) respuesta = 'Uy, se me enredó algo 🙈 ¿Me lo repites, por favor?';\n\n// Convierte el formato Markdown al formato de WhatsApp\nrespuesta = respuesta\n  .replace(/\\*\\*(.+?)\\*\\*/g, '*$1*')                          // **negrita** → *negrita*\n  .replace(/__(.+?)__/g, '_$1_')                              // __cursiva__ → _cursiva_\n  .replace(/^#{1,6}\\s*/gm, '')                                // quita títulos #\n  .replace(/^\\s*[-*]\\s+/gm, '• ')                             // viñetas - o * → •\n  .replace(/\\[([^\\]]+)\\]\\((https?:[^)]+)\\)/g, '$1: $2');      // [texto](url) → texto: url\n\nif (t.riesgo && !respuesta.includes('192')) {\n  respuesta += '\\n\\nSi estás en peligro ahora mismo, llama al *123*. También puedes hablar ya con la línea de salud mental *192, opción 4*. 💙';\n}\nreturn [{ json: { destino: t.whatsapp_jid, respuesta } }];"
+      },
+      "id": "fa374082-e933-4e6e-a162-65b9999ab52c",
+      "name": "Garantizar recursos de seguridad",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        544,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $('Clasificar evento').first().json.instancia }}",
+        "remoteJid": "={{ $json.destino }}",
+        "messageText": "={{ $json.respuesta }}​",
+        "options_message": {}
+      },
+      "id": "f27618da-751c-4481-8511-dc0eb7e85c54",
+      "name": "Responder por WhatsApp",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        704,
+        128
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "chat-api",
+        "operation": "send-presence",
+        "instanceName": "={{ $('Clasificar evento').first().json.instancia }}",
+        "remoteJid": "={{ $('Clasificar evento').first().json.whatsapp_jid }}"
+      },
+      "id": "5e1a3717-0865-4d08-a0b3-7ca4b93c7595",
+      "name": "Avisar \"escribiendo...\" (texto)",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        -1456,
+        224
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "chat-api",
+        "operation": "send-presence",
+        "instanceName": "={{ $('Clasificar evento').first().json.instancia }}",
+        "remoteJid": "={{ $('Clasificar evento').first().json.whatsapp_jid }}"
+      },
+      "id": "9fc3eaf2-cf05-4859-9d19-f279981cafb1",
+      "name": "Avisar \"escribiendo...\" (audio)",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        -1456,
+        416
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "name": "registrar_solicitud",
+        "description": "Registra una solicitud de cita (pre-agendamiento) en Salud Integral y notifica a la encargada. Úsala solo después de que el estudiante confirme el resumen. Antes de guardar revisa que el horario siga libre. Devuelve ok, id, estado, requiere_pago y mensaje; si ok es false trae faltantes, o horario_no_disponible con nuevas opciones.",
+        "workflowId": {
+          "__rl": true,
+          "value": "A4Pgkq5rbnBw26ef",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/A4Pgkq5rbnBw26ef",
+          "cachedResultName": "· 0 · Herramientas (sub-workflow)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "accion": "registrar",
+            "telefono": "={{ $('Parsear triage').first().json.telefono }}",
+            "whatsapp_jid": "={{ $('Parsear triage').first().json.whatsapp_jid }}",
+            "nombre_perfil": "={{ $('Parsear triage').first().json.nombre_perfil }}",
+            "ultimo_mensaje": "={{ $('Parsear triage').first().json.texto }}",
+            "nombre": "={{ $fromAI('nombre', `Nombre completo del estudiante`, 'string') }}",
+            "codigo": "={{ $fromAI('codigo', `Código estudiantil, solo números`, 'string') }}",
+            "tipo_documento": "={{ $fromAI('tipo_documento', `Tipo de documento: CC, TI, CE, PPT o PA (pasaporte)`, 'string') }}",
+            "numero_documento": "={{ $fromAI('numero_documento', `Número del documento de identidad, distinto del código estudiantil`, 'string') }}",
+            "programa": "={{ $fromAI('programa', `Programa académico`, 'string') }}",
+            "correo": "={{ $fromAI('correo', `Correo electrónico del estudiante`, 'string') }}",
+            "telefono_contacto": "={{ $fromAI('telefono_contacto', `Celular de contacto si es distinto del WhatsApp desde el que escribe; vacío si es el mismo`, 'string') }}",
+            "servicio": "={{ $fromAI('servicio', `Uno de: psicología, medicina, odontología`, 'string') }}",
+            "disponibilidad": "={{ $fromAI('disponibilidad', `Texto de la opción de horario elegida, tal como la devolvió consultar_horarios`, 'string') }}",
+            "fecha_solicitada": "={{ $fromAI('fecha_solicitada', `Fecha de la opción elegida, AAAA-MM-DD, tal como la devolvió consultar_horarios`, 'string') }}",
+            "hora_solicitada": "={{ $fromAI('hora_solicitada', `Hora de la opción elegida, HH:mm, tal como la devolvió consultar_horarios`, 'string') }}",
+            "profesional_solicitado": "={{ $fromAI('profesional_solicitado', `Profesional de la opción elegida`, 'string') }}",
+            "tipo_atencion": "={{ $fromAI('tipo_atencion', `Tipo de atención: primera_vez, seguimiento o control`, 'string') }}",
+            "edad": "={{ $fromAI('edad', `Edad del estudiante en años (solo el número)`, 'string') }}",
+            "facultad": "={{ $fromAI('facultad', `Facultad a la que pertenece el programa`, 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "accion",
+              "displayName": "accion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre_perfil",
+              "displayName": "nombre_perfil",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id_solicitud",
+              "displayName": "id_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "motivo",
+              "displayName": "motivo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ultimo_mensaje",
+              "displayName": "ultimo_mensaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_desde",
+              "displayName": "fecha_desde",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "franja",
+              "displayName": "franja",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_documento",
+              "displayName": "tipo_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_documento",
+              "displayName": "numero_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correo",
+              "displayName": "correo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono_contacto",
+              "displayName": "telefono_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional",
+              "displayName": "profesional",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_atencion",
+              "displayName": "tipo_atencion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mimetype",
+              "displayName": "mimetype",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "edad",
+              "displayName": "edad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "facultad",
+              "displayName": "facultad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      },
+      "id": "caac0aa4-c2be-459a-af8e-d2cebd824c64",
+      "name": "registrar_solicitud",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.1,
+      "position": [
+        544,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "name": "consultar_horarios",
+        "description": "Consulta en las agendas de Salud Integral los horarios LIBRES de un servicio a partir de una fecha, opcionalmente con un profesional. Úsala siempre antes de ofrecer fechas u horas. Devuelve ok, opciones (fecha, hora, texto, profesional) y profesionales (quiénes atienden ese servicio). Si ok es false, trae el motivo.",
+        "workflowId": {
+          "__rl": true,
+          "value": "A4Pgkq5rbnBw26ef",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/A4Pgkq5rbnBw26ef",
+          "cachedResultName": "· 0 · Herramientas (sub-workflow)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "accion": "horarios",
+            "telefono": "={{ $('Parsear triage').first().json.telefono }}",
+            "whatsapp_jid": "={{ $('Parsear triage').first().json.whatsapp_jid }}",
+            "nombre_perfil": "={{ $('Parsear triage').first().json.nombre_perfil }}",
+            "ultimo_mensaje": "={{ $('Parsear triage').first().json.texto }}",
+            "servicio": "={{ $fromAI('servicio', `Uno de: psicología, medicina, odontología`, 'string') }}",
+            "fecha_desde": "={{ $fromAI('fecha_desde', `Fecha desde la que se buscan horarios en formato AAAA-MM-DD, calculada con la fecha actual del Contexto. Debe ser posterior a hoy. Vacío = desde mañana`, 'string') }}",
+            "franja": "={{ $fromAI('franja', `mañana, tarde o vacío si le da igual`, 'string') }}",
+            "profesional": "={{ $fromAI('profesional', `Nombre o apellido del profesional que prefiere el estudiante; vacío si le da igual`, 'string') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "accion",
+              "displayName": "accion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre_perfil",
+              "displayName": "nombre_perfil",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id_solicitud",
+              "displayName": "id_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "motivo",
+              "displayName": "motivo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ultimo_mensaje",
+              "displayName": "ultimo_mensaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_desde",
+              "displayName": "fecha_desde",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "franja",
+              "displayName": "franja",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_documento",
+              "displayName": "tipo_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_documento",
+              "displayName": "numero_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correo",
+              "displayName": "correo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono_contacto",
+              "displayName": "telefono_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional",
+              "displayName": "profesional",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_atencion",
+              "displayName": "tipo_atencion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mimetype",
+              "displayName": "mimetype",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "edad",
+              "displayName": "edad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "facultad",
+              "displayName": "facultad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ]
+        }
+      },
+      "id": "d25cf688-00a3-4eb9-84fb-dd64e7c394a0",
+      "name": "consultar_horarios",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.1,
+      "position": [
+        720,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "A4Pgkq5rbnBw26ef",
+          "mode": "list",
+          "cachedResultName": "· 0 · Herramientas (sub-workflow)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "accion": "comprobante",
+            "telefono": "={{ $json.telefono }}",
+            "whatsapp_jid": "={{ $json.whatsapp_jid }}",
+            "nombre_perfil": "={{ $json.nombre_perfil }}",
+            "ultimo_mensaje": "={{ $json.texto }}",
+            "message_id": "={{ $json.message_id }}",
+            "mimetype": "={{ $json.mimetype }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "accion",
+              "displayName": "accion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre_perfil",
+              "displayName": "nombre_perfil",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id_solicitud",
+              "displayName": "id_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "motivo",
+              "displayName": "motivo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ultimo_mensaje",
+              "displayName": "ultimo_mensaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_desde",
+              "displayName": "fecha_desde",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "franja",
+              "displayName": "franja",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_documento",
+              "displayName": "tipo_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_documento",
+              "displayName": "numero_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correo",
+              "displayName": "correo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono_contacto",
+              "displayName": "telefono_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional",
+              "displayName": "profesional",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_atencion",
+              "displayName": "tipo_atencion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mimetype",
+              "displayName": "mimetype",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "f1561277-79a0-4212-ade0-6f20a224fc88",
+      "name": "Registrar comprobante",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        -1456,
+        832
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $('Clasificar evento').first().json.instancia }}",
+        "remoteJid": "={{ $('Clasificar evento').first().json.whatsapp_jid }}",
+        "messageText": "={{ $json.mensaje || 'Recibí tu archivo, pero tuve un problema técnico al registrarlo 🙈 ¿Me lo envías de nuevo en unos minutos?' }}​",
+        "options_message": {}
+      },
+      "id": "e6a0cbc1-0132-457f-8523-2b04b6d54787",
+      "name": "Responder comprobante",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        -1232,
+        832
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "name": "consultar_mis_solicitudes",
+        "description": "Devuelve las solicitudes de cita del estudiante que escribe, ya resumidas: para cada una id, servicio, categoria (RECIBIDA, PENDIENTE, CONFIRMADA, CANCELACION_EN_TRAMITE, CANCELADA, RECHAZADA o CERRADA), estado_texto, siguiente_paso, profesional y cuando. También datos_estudiante para no volver a pedirlos. No necesita parámetros.",
+        "workflowId": {
+          "__rl": true,
+          "value": "A4Pgkq5rbnBw26ef",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/A4Pgkq5rbnBw26ef",
+          "cachedResultName": "· 0 · Herramientas (sub-workflow)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "accion": "mis_solicitudes",
+            "telefono": "={{ $('Parsear triage').first().json.telefono }}",
+            "whatsapp_jid": "={{ $('Parsear triage').first().json.whatsapp_jid }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "accion",
+              "displayName": "accion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre_perfil",
+              "displayName": "nombre_perfil",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id_solicitud",
+              "displayName": "id_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "motivo",
+              "displayName": "motivo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ultimo_mensaje",
+              "displayName": "ultimo_mensaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_desde",
+              "displayName": "fecha_desde",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "franja",
+              "displayName": "franja",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitada",
+              "displayName": "fecha_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hora_solicitada",
+              "displayName": "hora_solicitada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional_solicitado",
+              "displayName": "profesional_solicitado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_documento",
+              "displayName": "tipo_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "numero_documento",
+              "displayName": "numero_documento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correo",
+              "displayName": "correo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "telefono_contacto",
+              "displayName": "telefono_contacto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "profesional",
+              "displayName": "profesional",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tipo_atencion",
+              "displayName": "tipo_atencion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mimetype",
+              "displayName": "mimetype",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "edad",
+              "displayName": "edad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "facultad",
+              "displayName": "facultad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ]
+        }
+      },
+      "id": "4400ac53-0f4d-4037-8260-c89176d9af64",
+      "name": "consultar_mis_solicitudes",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.1,
+      "position": [
+        384,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-9-AC-2 · Si OpenAI (triage o agente) falla, el estudiante recibe un mensaje fijo, sin IA,\n// en vez de quedarse sin respuesta. Máximo un aviso cada 10 minutos por chat (evita ciclos y spam).\nconst c = $('Clasificar evento').first().json;\nconst sd = $getWorkflowStaticData('global');\nsd.fallas = sd.fallas || {};\nconst ahora = Date.now();\nif (ahora - (sd.fallas[c.telefono] || 0) < 10 * 60000) return [];\nsd.fallas[c.telefono] = ahora;\nfor (const k of Object.keys(sd.fallas)) if (ahora - sd.fallas[k] > 3600000) delete sd.fallas[k];\nreturn [{ json: { instancia: c.instancia, destino: c.whatsapp_jid } }];\n"
+      },
+      "id": "7744e54f-87dd-4114-a402-8e928bf62401",
+      "name": "¿Avisar falla?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $json.instancia }}",
+        "remoteJid": "={{ $json.destino }}",
+        "messageText": "Lo siento 🙏 en este momento tengo un problema técnico y no pude procesar tu mensaje. No es nada que hayas hecho y lo que ya me contaste queda guardado. Escríbeme de nuevo en unos minutos; si es urgente, puedes acercarte a Salud Integral.​",
+        "options_message": {}
+      },
+      "id": "3963d9af-a2fe-40e5-860d-c060543ea69e",
+      "name": "WhatsApp: mensaje de respaldo",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        592
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {
+    "Avisar \"escribiendo...\" (audio)": [
+      {
+        "json": {
+          "name": "First item",
+          "code": 1
+        }
+      },
+      {
+        "json": {
+          "name": "Second item",
+          "code": 2
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook Evolution": {
+      "main": [
+        [
+          {
+            "node": "Clasificar evento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clasificar evento": {
+      "main": [
+        [
+          {
+            "node": "¿Quién escribe?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Quién escribe?": {
+      "main": [
+        [
+          {
+            "node": "Guardar estado del chat",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Estado del chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Estado del chat": {
+      "main": [
+        [
+          {
+            "node": "Tipo de mensaje",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tipo de mensaje": {
+      "main": [
+        [
+          {
+            "node": "Avisar \"escribiendo...\" (texto)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Avisar \"escribiendo...\" (audio)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder: formato no soportado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [],
+        [
+          {
+            "node": "Registrar comprobante",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Descargar audio": {
+      "main": [
+        [
+          {
+            "node": "Audio a archivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audio a archivo": {
+      "main": [
+        [
+          {
+            "node": "Transcribir audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcribir audio": {
+      "main": [
+        [
+          {
+            "node": "Preparar entrada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar entrada": {
+      "main": [
+        [
+          {
+            "node": "Triage (intención + riesgo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Modelo triage": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Triage (intención + riesgo)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage (intención + riesgo)": {
+      "main": [
+        [
+          {
+            "node": "Parsear triage",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Avisar falla?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parsear triage": {
+      "main": [
+        [
+          {
+            "node": "¿Riesgo?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "UnicaU (agente)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Riesgo?": {
+      "main": [
+        [
+          {
+            "node": "Alerta de riesgo a Natalia",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Modelo UnicaU": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "UnicaU (agente)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Memoria por teléfono": {
+      "ai_memory": [
+        [
+          {
+            "node": "UnicaU (agente)",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "solicitar_cancelacion": {
+      "ai_tool": [
+        [
+          {
+            "node": "UnicaU (agente)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "escalar_a_humano": {
+      "ai_tool": [
+        [
+          {
+            "node": "UnicaU (agente)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UnicaU (agente)": {
+      "main": [
+        [
+          {
+            "node": "Garantizar recursos de seguridad",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Avisar falla?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Garantizar recursos de seguridad": {
+      "main": [
+        [
+          {
+            "node": "Responder por WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avisar \"escribiendo...\" (texto)": {
+      "main": [
+        [
+          {
+            "node": "Preparar entrada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avisar \"escribiendo...\" (audio)": {
+      "main": [
+        [
+          {
+            "node": "Descargar audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "consultar_horarios": {
+      "ai_tool": [
+        [
+          {
+            "node": "UnicaU (agente)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "registrar_solicitud": {
+      "ai_tool": [
+        [
+          {
+            "node": "UnicaU (agente)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registrar comprobante": {
+      "main": [
+        [
+          {
+            "node": "Responder comprobante",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Avisar falla?": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp: mensaje de respaldo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "consultar_mis_solicitudes": {
+      "ai_tool": [
+        [
+          {
+            "node": "UnicaU (agente)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "b3e425a2-9913-4f9f-9079-ee738b29388f",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9cd8ef88dfd6559185ae60df03ae5890b0ce817a5691f8fd8d5c73b81fcc118b"
+  },
+  "id": "L3mbByNnsEAE5FrZ",
+  "tags": []
+}

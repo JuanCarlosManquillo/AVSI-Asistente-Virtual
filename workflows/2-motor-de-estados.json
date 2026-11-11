@@ -1,0 +1,1812 @@
+{
+  "name": "2 · Motor de estados (confirmaciones y recordatorios)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 2
+            }
+          ]
+        }
+      },
+      "id": "28b06460-e95d-40e6-80de-da882f4a75bf",
+      "name": "Cada 2 minutos",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1072,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "ad22c735-8bcf-47ce-a3ad-d53cc43baffd",
+      "name": "Leer solicitudes",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -688,
+        240
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Motor de estados sobre la hoja \"Solicitudes\". Una acción por fila por ejecución.\n// Las notificaciones de solicitudes nuevas y cancelaciones ya salen al instante desde el\n// sub-workflow; aquí solo se reintentan si el correo había fallado (bandera vacía).\n// US-2-AC-3: la confirmación y el recordatorio dicen qué profesional asignó Erika\n// (columna profesional_asignado; si está vacía, el que eligió el estudiante).\n// US-5: las solicitudes PENDIENTE_VALIDACION también se avisan a la encargada.\n// US-6: avisa al estudiante cada cambio de estado_pago que hace Erika (recibo enviado, pago validado,\n//       comprobante rechazado) y NO confirma una cita que requiere pago hasta que el pago esté validado.\n// US-7: avisa al estudiante cuando Salud Integral RECHAZA o CANCELA su solicitud (aviso_estado = POR_AVISAR,\n//       lo pone el Apps Script de la hoja) y CIERRA solo las citas CONFIRMADAS que ya pasaron (estado CERRADA).\n//       Las filas antiguas nunca tienen POR_AVISAR, así que no reciben avisos.\nconst AVISOS_PAGO = ['RECIBO_ENVIADO', 'PAGO_VALIDADO', 'COMPROBANTE_RECHAZADO'];\nconst HORAS_RECORDATORIO = 24;\nconst DURACION_MIN = 30;           // duración usada para el evento de calendario\nconst ZONA = 'America/Bogota';\nconst FINALES = ['RECHAZADA', 'CANCELADA', 'CERRADA'];\nconst MAX_CIERRES = 20;           // cierres automáticos por ejecución (cuida el límite de escrituras de Google)\nlet cierres = 0;\nconst ahora = DateTime.now().setZone(ZONA);\n\nfunction parseFecha(f) {\n  if (f === '' || f == null) return null;\n  if (typeof f === 'number')\n    return DateTime.fromObject({ year: 1899, month: 12, day: 30 }, { zone: ZONA }).plus({ days: Math.floor(f) });\n  const s = String(f).trim();\n  for (const fmt of ['dd/MM/yyyy', 'd/M/yyyy', 'yyyy-MM-dd']) {\n    const d = DateTime.fromFormat(s, fmt, { zone: ZONA });\n    if (d.isValid) return d;\n  }\n  return null;\n}\nfunction parseHora(h) {\n  if (h === '' || h == null) return null;\n  if (typeof h === 'number') { const m = Math.round(h * 1440); return { hour: Math.floor(m / 60) % 24, minute: m % 60 }; }\n  const s = String(h).trim().toLowerCase().replace(/\\s+/g, '').replace(/\\./g, '');\n  const m = s.match(/^(\\d{1,2})(?::(\\d{2}))?(am|pm)?$/);\n  if (!m) return null;\n  let hour = +m[1]; const minute = m[2] ? +m[2] : 0;\n  if (m[3] === 'pm' && hour < 12) hour += 12;\n  if (m[3] === 'am' && hour === 12) hour = 0;\n  return { hour, minute };\n}\nconst si = v => String(v ?? '').trim().toUpperCase() === 'SI';\nconst cap = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : s;\nconst profesionalDe = r => String(r.profesional_asignado || r.profesional_solicitado || '').trim();\n\nfunction enlaceCalendario(r, cita) {\n  const fmt = d => d.toUTC().toFormat(\"yyyyLLdd'T'HHmmss'Z'\");\n  const p = {\n    action: 'TEMPLATE',\n    text: `Cita de ${cap(r.servicio)} · Salud Integral Unicauca`,\n    dates: `${fmt(cita)}/${fmt(cita.plus({ minutes: DURACION_MIN }))}`,\n    details: `Solicitud ${r.id}.${profesionalDe(r) ? ' Profesional: ' + profesionalDe(r) + '.' : ''} Si no puedes asistir, escribe CANCELAR a UnicaU por WhatsApp.`,\n    location: 'Salud Integral, Universidad del Cauca',\n    ctz: ZONA,\n  };\n  return 'https://calendar.google.com/calendar/render?' +\n    Object.entries(p).map(([k, v]) => k + '=' + encodeURIComponent(v).replace(/%2F/g, '/')).join('&');\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const r = item.json;\n  if (!r.id) continue;\n  const estado = String(r.estado ?? '').trim().toUpperCase();\n  let accion = null, cita = null;\n\n  const estadoPago = String(r.estado_pago ?? '').trim().toUpperCase();\n  const pagoPendiente = String(r.requiere_pago ?? '').trim().toUpperCase() === 'SI' && estadoPago !== 'PAGO_VALIDADO';\n  if ((estado === 'PENDIENTE' || estado === 'PENDIENTE_VALIDACION') && !si(r.notificado_encargada)) accion = 'notificar_nueva';\n  else if (estado === 'CANCELACION_SOLICITADA' && !si(r.notificado_cancelacion)) accion = 'notificar_cancelacion';\n  else if ((estado === 'RECHAZADA' || estado === 'CANCELADA') && String(r.aviso_estado ?? '').trim().toUpperCase() === 'POR_AVISAR')\n    accion = 'aviso_estado';\n  // Agenda: el Apps Script detectó que Erika bloqueó (combinó celdas) la franja de la cita o del horario pedido.\n  else if (String(r.aviso_bloqueo ?? '').trim().toUpperCase() === 'POR_AVISAR' && ['CONFIRMADA', 'PENDIENTE', 'PENDIENTE_VALIDACION'].includes(estado))\n    accion = 'aviso_bloqueo';\n  else if (!FINALES.includes(estado) && estado !== 'CANCELACION_SOLICITADA' && AVISOS_PAGO.includes(estadoPago)\n           && String(r.aviso_pago_estado ?? '').trim().toUpperCase() !== estadoPago) accion = 'aviso_pago';\n  else if (estado === 'CONFIRMADA' && !pagoPendiente) {\n    const f = parseFecha(r.fecha_cita), h = parseHora(r.hora_cita);\n    if (f && h) {\n      cita = f.set({ hour: h.hour, minute: h.minute });\n      if (cita < ahora) {\n        // US-7: la cita ya pasó. Nunca se confirma ni se recuerda una cita pasada; al día siguiente se cierra.\n        if (cita.plus({ days: 1 }) < ahora && cierres < MAX_CIERRES) { accion = 'cerrar'; cierres++; }\n      }\n      else if (!si(r.confirmacion_enviada)) accion = 'confirmar_estudiante';\n      else if (!si(r.recordatorio_enviado) && cita.diff(ahora, 'hours').hours <= HORAS_RECORDATORIO) accion = 'recordatorio';\n    }\n  }\n  if (!accion) continue;\n  let horarioBloqueado = '';\n  if (accion === 'aviso_bloqueo') {\n    const fb = parseFecha(estado === 'CONFIRMADA' ? r.fecha_cita : r.fecha_solicitada), hb = parseHora(estado === 'CONFIRMADA' ? r.hora_cita : r.hora_solicitada);\n    if (fb && hb) horarioBloqueado = fb.set({ hour: hb.hour, minute: hb.minute }).setLocale('es').toFormat(\"cccc d 'de' LLLL 'a las' h:mm a\");\n  }\n  const telefono = String(r.telefono ?? '').replace(/\\D/g, '');\n  out.push({ json: {\n    ...r, accion, telefono,\n    destino: String(r.whatsapp_jid ?? '').trim() || telefono,\n    primer_nombre: String(r.nombre ?? '').trim().split(/\\s+/)[0] || '',\n    profesional: profesionalDe(r),\n    estado_pago: estadoPago,\n    estado_anterior: estado,\n    motivo_estado: String(r.motivo_estado ?? '').trim(),\n    fecha_estado_nueva: ahora.toFormat('yyyy-MM-dd HH:mm'),\n    cita_texto: cita ? cita.setLocale('es').toFormat(\"cccc d 'de' LLLL 'a las' h:mm a\") : '',\n    enlace_calendario: cita ? enlaceCalendario(r, cita) : '',\n    horario_bloqueado: horarioBloqueado,\n  }});\n}\nreturn out;"
+      },
+      "id": "94abf59b-b077-4c6a-8c74-1eb2cd7d3cf3",
+      "name": "Clasificar acciones",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -464,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 8,
+        "output": "={{ ({notificar_nueva:0, notificar_cancelacion:1, confirmar_estudiante:2, recordatorio:3, aviso_pago:4, aviso_estado:5, cerrar:6, aviso_bloqueo:7})[$json.accion] }}"
+      },
+      "id": "a3866662-074b-45ac-a4a7-6b2286a92df3",
+      "name": "¿Qué acción?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -240,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "=573234062106@s.whatsapp.net",
+        "messageText": "=🆕 *Nueva solicitud UnicaU · {{ $json.id }}*\n\n*Servicio:* {{ $json.servicio }}\n*Nombre:* {{ $json.nombre }}\n*Código:* {{ $json.codigo }}\n*Programa:* {{ $json.programa }}\n*Disponibilidad:* {{ $json.disponibilidad }}\n*Celular:* +{{ $json.telefono_contacto }}\n\nPara confirmarla, en la hoja Solicitudes escribe fecha_cita y hora_cita y cambia el estado a CONFIRMADA:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
+        "options_message": {}
+      },
+      "id": "4e5d3b87-fc1b-4414-828f-340cbf62f261",
+      "name": "WhatsApp a Natalia: nueva (reintento)",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "=573234062106@s.whatsapp.net",
+        "messageText": "=❌ *Cancelación UnicaU · {{ $json.id }}*\n\n{{ $json.nombre }} ({{ $json.codigo }}) canceló su solicitud de {{ $json.servicio }}.\nFecha registrada: {{ $json.fecha_cita || 'sin fecha asignada' }} {{ $json.hora_cita }}\n\nEse cupo queda libre para otro estudiante. Cuando lo liberes, cambia el estado a CANCELADA en la hoja:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
+        "options_message": {}
+      },
+      "id": "a120c4d1-5cb8-4bac-af65-9adf7c8ee550",
+      "name": "WhatsApp a Natalia: cancelación (reintento)",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        0,
+        160
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "={{ $json.destino }}",
+        "messageText": "=¡Hola, {{ $json.primer_nombre }}! 💙❤️ Soy UnicaU.\nTu cita de *{{ $json.servicio }}* en Salud Integral quedó confirmada para el *{{ $json.cita_texto }}*{{ $json.profesional ? ' con *' + $json.profesional + '*' : '' }}.{{ $json.observaciones ? '\\n\\n📌 ' + $json.observaciones : '' }}\n\n📅 Guárdala en tu calendario para que no se te pase:\n{{ $json.enlace_calendario }}\n\nSi no puedes asistir, respóndeme *CANCELAR* y así el cupo le sirve a otro estudiante.​​",
+        "options_message": {}
+      },
+      "id": "9bdeb32c-930f-4448-88d4-b3cc989b483b",
+      "name": "WhatsApp: confirmación",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        0,
+        320
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "={{ $json.destino }}",
+        "messageText": "=Hola, {{ $json.primer_nombre }} 👋 Te recuerdo tu cita de *{{ $json.servicio }}* en Salud Integral{{ $json.profesional ? ' con *' + $json.profesional + '*' : '' }}: *{{ $json.cita_texto }}*.\n\nSi ya no puedes ir, respóndeme *CANCELAR* y ese cupo pasa a otro estudiante que lo necesita. ¡Que te vaya muy bien!​​",
+        "options_message": {}
+      },
+      "id": "ddafd4c3-89e2-45eb-baaa-af4750c6fa83",
+      "name": "WhatsApp: recordatorio",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        0,
+        480
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Clasificar acciones').item.json.id }}",
+            "notificado_encargada": "SI"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "fecha_solicitud",
+              "displayName": "fecha_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "estado",
+              "displayName": "estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "fecha_cita",
+              "displayName": "fecha_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "hora_cita",
+              "displayName": "hora_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "observaciones",
+              "displayName": "observaciones",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_encargada",
+              "displayName": "notificado_encargada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notificado_cancelacion",
+              "displayName": "notificado_cancelacion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "confirmacion_enviada",
+              "displayName": "confirmacion_enviada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "recordatorio_enviado",
+              "displayName": "recordatorio_enviado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "5554dfe8-9224-465d-957d-798157a00e97",
+      "name": "Marcar notificado_encargada",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Clasificar acciones').item.json.id }}",
+            "notificado_cancelacion": "SI"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitud",
+              "displayName": "fecha_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "estado",
+              "displayName": "estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "fecha_cita",
+              "displayName": "fecha_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "hora_cita",
+              "displayName": "hora_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "observaciones",
+              "displayName": "observaciones",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_encargada",
+              "displayName": "notificado_encargada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_cancelacion",
+              "displayName": "notificado_cancelacion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confirmacion_enviada",
+              "displayName": "confirmacion_enviada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "recordatorio_enviado",
+              "displayName": "recordatorio_enviado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "76ef754c-7436-4ad8-b737-ea972299fe49",
+      "name": "Marcar notificado_cancelacion",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        160
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Clasificar acciones').item.json.id }}",
+            "confirmacion_enviada": "={{ $json.error ? '' : 'SI' }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitud",
+              "displayName": "fecha_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "estado",
+              "displayName": "estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "fecha_cita",
+              "displayName": "fecha_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "hora_cita",
+              "displayName": "hora_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "observaciones",
+              "displayName": "observaciones",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_encargada",
+              "displayName": "notificado_encargada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_cancelacion",
+              "displayName": "notificado_cancelacion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "confirmacion_enviada",
+              "displayName": "confirmacion_enviada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recordatorio_enviado",
+              "displayName": "recordatorio_enviado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "a0c1d66f-aefc-4f57-9b57-d3a5329c90f5",
+      "name": "Marcar confirmacion_enviada",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        320
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Clasificar acciones').item.json.id }}",
+            "recordatorio_enviado": "={{ $json.error ? '' : 'SI' }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_solicitud",
+              "displayName": "fecha_solicitud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "nombre",
+              "displayName": "nombre",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "codigo",
+              "displayName": "codigo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "programa",
+              "displayName": "programa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "servicio",
+              "displayName": "servicio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "disponibilidad",
+              "displayName": "disponibilidad",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "telefono",
+              "displayName": "telefono",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "estado",
+              "displayName": "estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "fecha_cita",
+              "displayName": "fecha_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "hora_cita",
+              "displayName": "hora_cita",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "observaciones",
+              "displayName": "observaciones",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_encargada",
+              "displayName": "notificado_encargada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "notificado_cancelacion",
+              "displayName": "notificado_cancelacion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "confirmacion_enviada",
+              "displayName": "confirmacion_enviada",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "recordatorio_enviado",
+              "displayName": "recordatorio_enviado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "whatsapp_jid",
+              "displayName": "whatsapp_jid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "96eb1ab6-d9d4-4da4-b193-5ebc580815e3",
+      "name": "Marcar recordatorio_enviado",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        480
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "={{ $json.destino }}",
+        "messageText": "={{ $json.estado_pago === 'RECIBO_ENVIADO' ? 'Hola, ' + $json.primer_nombre + ' 👋 Salud Integral te envió el recibo de pago de tu solicitud *' + $json.id + '* (' + $json.servicio + ') al correo ' + $json.correo + '. Cuando pagues, envíame por aquí una foto o el PDF del comprobante 🧾.' : $json.estado_pago === 'PAGO_VALIDADO' ? '¡Listo, ' + $json.primer_nombre + '! ✅ Salud Integral validó el pago de tu solicitud *' + $json.id + '*. Apenas tu cita quede confirmada te escribo con la fecha y la hora.' : 'Hola, ' + $json.primer_nombre + '. Salud Integral no pudo validar el comprobante de tu solicitud *' + $json.id + '*' + ($json.observaciones ? ': ' + $json.observaciones : '') + '. ¿Me envías de nuevo una foto clara o el PDF del comprobante?' }}​",
+        "options_message": {}
+      },
+      "id": "60aca40f-bcb4-4bb2-8c99-ab29bff697bd",
+      "name": "WhatsApp: aviso de pago",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        0,
+        688
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Clasificar acciones').item.json.id }}",
+            "aviso_pago_estado": "={{ $('Clasificar acciones').item.json.estado_pago }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "aviso_pago_estado",
+              "displayName": "aviso_pago_estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "1abe6876-75ff-48e3-9e84-ca26040fa0e3",
+      "name": "Marcar aviso_pago_estado",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        688
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "={{ $json.destino }}",
+        "messageText": "={{ $json.estado === 'RECHAZADA' ? 'Hola, ' + $json.primer_nombre + '. Salud Integral revisó tu solicitud *' + $json.id + '* (' + $json.servicio + ') y no fue posible aprobarla' + ($json.motivo_estado ? ': ' + $json.motivo_estado : '') + '. Si quieres, te ayudo a hacer una nueva solicitud.' : 'Hola, ' + $json.primer_nombre + '. Tu solicitud *' + $json.id + '* (' + $json.servicio + ') quedó cancelada' + ($json.motivo_estado ? ': ' + $json.motivo_estado : '') + '. Si necesitas una nueva cita, escríbeme y te ayudo.' }}​",
+        "options_message": {}
+      },
+      "id": "af616cf0-bb7a-41ec-a85c-c11bd7a751d6",
+      "name": "WhatsApp: aviso de estado",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        0,
+        880
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Clasificar acciones').item.json.id }}",
+            "aviso_estado": "={{ $json.error ? 'POR_AVISAR' : $('Clasificar acciones').item.json.estado }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "aviso_estado",
+              "displayName": "aviso_estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "5dd26430-5b13-4fd7-911d-230f95f284a2",
+      "name": "Marcar aviso_estado",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        880
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.id }}",
+            "estado": "CERRADA",
+            "fecha_estado": "={{ $json.fecha_estado_nueva }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "estado",
+              "displayName": "estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fecha_estado",
+              "displayName": "fecha_estado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "60683d55-cc23-46bc-b34f-cc8c215d60d1",
+      "name": "Cerrar solicitud",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        448,
+        1072
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Historial",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "fecha": "={{ $now.setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm') }}",
+            "id": "={{ $json.id }}",
+            "campo": "estado",
+            "valor_anterior": "CONFIRMADA",
+            "valor_nuevo": "CERRADA",
+            "actor": "UnicaU (motor)",
+            "origen": "n8n",
+            "detalle": "Cierre automático: la cita ya pasó"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "fecha",
+              "displayName": "fecha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "campo",
+              "displayName": "campo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_anterior",
+              "displayName": "valor_anterior",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "valor_nuevo",
+              "displayName": "valor_nuevo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actor",
+              "displayName": "actor",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "origen",
+              "displayName": "origen",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "detalle",
+              "displayName": "detalle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "8dd92012-c9d8-47aa-a779-ceb8e4b93d7c",
+      "name": "Historial: cierre automático",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        672,
+        1072
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "c676f35b-99a3-41f8-8959-7bbca2dc4b5e",
+      "name": "Releer solicitudes",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        0,
+        1072
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// US-7: vuelve a mirar la hoja justo antes de cerrar, por si alguien cambió el estado\n// mientras el motor trabajaba. Solo cierra las que SIGUEN en CONFIRMADA.\nconst candidatas = new Set($('Clasificar acciones').all().filter(x => x.json.accion === 'cerrar').map(x => String(x.json.id)));\nconst ahora = DateTime.now().setZone('America/Bogota').toFormat('yyyy-MM-dd HH:mm');\nreturn $input.all()\n  .filter(i => candidatas.has(String(i.json.id)) && String(i.json.estado ?? '').trim().toUpperCase() === 'CONFIRMADA')\n  .map(i => ({ json: { id: i.json.id, fecha_estado_nueva: ahora } }));"
+      },
+      "id": "b4bcadbc-b07c-4811-9ec2-fe79d6dcbd8e",
+      "name": "¿Sigue CONFIRMADA?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        1072
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "1Occlfl05QhW_Q4y0Tnqz9e7PUThjRC1VxGqTItXxZ6g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Config",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "clave",
+              "lookupValue": "solicitudes_id"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "494729d2-dd94-4b8a-a99f-2dc8d28ab4ff",
+      "name": "Hoja del mes",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -880,
+        240
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      },
+      "notes": "Lee en Config (Simulaciones Chat) el ID de la hoja de solicitudes del mes actual. El Apps Script lo cambia solo cada mes."
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "Erika",
+        "remoteJid": "={{ $json.destino }}",
+        "messageText": "={{ $json.estado === 'CONFIRMADA' ? 'Hola, ' + $json.primer_nombre + '. Te escribimos de Salud Integral: tu cita *' + $json.id + '* de ' + $json.servicio + ($json.profesional ? ' con ' + $json.profesional : '') + ($json.horario_bloqueado ? ' del ' + $json.horario_bloqueado : '') + ' no podrá realizarse porque el profesional no estará disponible en ese horario. Salud Integral te contactará para asignarte uno nuevo. Si prefieres, escríbeme y te muestro los horarios disponibles.' : 'Hola, ' + $json.primer_nombre + '. El horario que pediste para tu solicitud *' + $json.id + '* (' + $json.servicio + ($json.horario_bloqueado ? ', ' + $json.horario_bloqueado : '') + ') ya no está disponible porque el profesional tendrá otra actividad. Salud Integral te asignará otro horario; si prefieres, escríbeme y te muestro los disponibles.' }}",
+        "options_message": {}
+      },
+      "id": "4ec074e7-3bf4-4744-8f6f-eb9eae0a99c8",
+      "name": "WhatsApp: aviso de bloqueo",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1072
+      ],
+      "credentials": {
+        "evolutionApi": {
+          "id": "cOCc6Jl6O8qbAj3e",
+          "name": "Evolution account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Hoja del mes').first().json.valor }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Solicitudes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Clasificar acciones').item.json.id }}",
+            "aviso_bloqueo": "={{ $json.error ? 'POR_AVISAR' : 'AVISADO' }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "aviso_bloqueo",
+              "displayName": "aviso_bloqueo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "001be728-7083-4656-967c-e5ac7ed9648b",
+      "name": "Marcar aviso_bloqueo",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        1072
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "0w9vpWhZCoU5U4mT",
+          "name": "Google Service Account account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Cada 2 minutos": {
+      "main": [
+        [
+          {
+            "node": "Hoja del mes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer solicitudes": {
+      "main": [
+        [
+          {
+            "node": "Clasificar acciones",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clasificar acciones": {
+      "main": [
+        [
+          {
+            "node": "¿Qué acción?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Qué acción?": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp a Natalia: nueva (reintento)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp a Natalia: cancelación (reintento)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp: confirmación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp: recordatorio",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp: aviso de pago",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp: aviso de estado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Releer solicitudes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp: aviso de bloqueo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp: confirmación": {
+      "main": [
+        [
+          {
+            "node": "Marcar confirmacion_enviada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp: recordatorio": {
+      "main": [
+        [
+          {
+            "node": "Marcar recordatorio_enviado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp a Natalia: nueva (reintento)": {
+      "main": [
+        [
+          {
+            "node": "Marcar notificado_encargada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp a Natalia: cancelación (reintento)": {
+      "main": [
+        [
+          {
+            "node": "Marcar notificado_cancelacion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp: aviso de pago": {
+      "main": [
+        [
+          {
+            "node": "Marcar aviso_pago_estado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp: aviso de estado": {
+      "main": [
+        [
+          {
+            "node": "Marcar aviso_estado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cerrar solicitud": {
+      "main": [
+        [
+          {
+            "node": "Historial: cierre automático",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Releer solicitudes": {
+      "main": [
+        [
+          {
+            "node": "¿Sigue CONFIRMADA?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Sigue CONFIRMADA?": {
+      "main": [
+        [
+          {
+            "node": "Cerrar solicitud",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hoja del mes": {
+      "main": [
+        [
+          {
+            "node": "Leer solicitudes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp: aviso de bloqueo": {
+      "main": [
+        [
+          {
+            "node": "Marcar aviso_bloqueo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "50f7638c-6f95-4d85-9f13-e627e4756471",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9cd8ef88dfd6559185ae60df03ae5890b0ce817a5691f8fd8d5c73b81fcc118b"
+  },
+  "id": "5krnOYkTXjpIqndP",
+  "tags": []
+}

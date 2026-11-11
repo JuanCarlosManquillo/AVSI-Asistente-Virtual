@@ -1,0 +1,8 @@
+# Normaliza finales de línea para evitar diffs ruidosos entre Windows y Linux.
+* text=auto eol=lf
+
+# Documentos binarios: nunca normalizar.
+*.docx binary
+*.pdf  binary
+*.png  binary
+*.jpg  binary
