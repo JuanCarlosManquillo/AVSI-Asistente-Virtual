@@ -132,7 +132,7 @@
         "resource": "messages-api",
         "instanceName": "Erika",
         "remoteJid": "=573234062106@s.whatsapp.net",
-        "messageText": "=🆕 *Nueva solicitud UnicaU · {{ $json.id }}*\n{{ $json.estado === 'PENDIENTE_VALIDACION' ? '⚠️ *Horario sin verificar:* revisa que siga libre antes de confirmar.\\n' : '' }}\n*Servicio:* {{ $json.servicio }} ({{ $json.tipo_atencion }})\n*Nombre:* {{ $json.nombre }}\n*Código:* {{ $json.codigo }}\n*Documento:* {{ $json.tipo_documento }} {{ $json.numero_documento }}\n*Programa:* {{ $json.programa }}\n*Correo:* {{ $json.correo }}\n*Teléfono de contacto:* +{{ $json.telefono_contacto }}\n*Horario elegido:* {{ $json.fecha_solicitada ? $json.fecha_solicitada + ' ' + $json.hora_solicitada + ' con ' + $json.profesional_solicitado : $json.disponibilidad }}\n*Pago:* {{ $json.requiere_pago === 'SI' ? 'requiere pago' + ($json.valor_pago ? ' (' + $json.valor_pago + ')' : '') + '. Genera el recibo, envíalo a ' + $json.correo + ' y cambia estado_pago a RECIBO_ENVIADO' : $json.requiere_pago === 'NO' ? 'no requiere' : 'POR CONFIRMAR. Define si tiene costo y actualiza requiere_pago y estado_pago' }}\n*WhatsApp:* +{{ $json.telefono }}\n\nPara confirmarla, en la hoja Solicitudes escribe fecha_cita, hora_cita y profesional_asignado, y cambia el estado a CONFIRMADA:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
+        "messageText": "=🆕 *Nueva solicitud AVSI · {{ $json.id }}*\n{{ $json.estado === 'PENDIENTE_VALIDACION' ? '⚠️ *Horario sin verificar:* revisa que siga libre antes de confirmar.\\n' : '' }}\n*Servicio:* {{ $json.servicio }} ({{ $json.tipo_atencion }})\n*Nombre:* {{ $json.nombre }}\n*Código:* {{ $json.codigo }}\n*Documento:* {{ $json.tipo_documento }} {{ $json.numero_documento }}\n*Programa:* {{ $json.programa }}\n*Correo:* {{ $json.correo }}\n*Teléfono de contacto:* +{{ $json.telefono_contacto }}\n*Horario elegido:* {{ $json.fecha_solicitada ? $json.fecha_solicitada + ' ' + $json.hora_solicitada + ' con ' + $json.profesional_solicitado : $json.disponibilidad }}\n*Pago:* {{ $json.requiere_pago === 'SI' ? 'requiere pago' + ($json.valor_pago ? ' (' + $json.valor_pago + ')' : '') + '. Genera el recibo, envíalo a ' + $json.correo + ' y cambia estado_pago a RECIBO_ENVIADO' : $json.requiere_pago === 'NO' ? 'no requiere' : 'POR CONFIRMAR. Define si tiene costo y actualiza requiere_pago y estado_pago' }}\n*WhatsApp:* +{{ $json.telefono }}\n\nPara confirmarla, en la hoja Solicitudes escribe fecha_cita, hora_cita y profesional_asignado, y cambia el estado a CONFIRMADA:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
         "options_message": {}
       },
       "id": "c0263582-e865-4af6-a0f1-136d46dc2bdb",
@@ -658,7 +658,7 @@
         "resource": "messages-api",
         "instanceName": "Erika",
         "remoteJid": "=573234062106@s.whatsapp.net",
-        "messageText": "=❌ *Cancelación UnicaU · {{ $json.id }}*\n\n{{ $json.nombre }} ({{ $json.codigo }}) canceló su solicitud de {{ $json.servicio }}.\nFecha registrada: {{ $json.fecha_cita || 'sin fecha asignada' }} {{ $json.hora_cita }}\n\nEse cupo queda libre para otro estudiante. Cuando lo liberes, cambia el estado a CANCELADA en la hoja:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
+        "messageText": "=❌ *Cancelación AVSI · {{ $json.id }}*\n\n{{ $json.nombre }} ({{ $json.codigo }}) canceló su solicitud de {{ $json.servicio }}.\nFecha registrada: {{ $json.fecha_cita || 'sin fecha asignada' }} {{ $json.hora_cita }}\n\nEse cupo queda libre para otro estudiante. Cuando lo liberes, cambia el estado a CANCELADA en la hoja:\nhttps://docs.google.com/spreadsheets/d/{{ $('Hoja del mes').first().json.valor }}",
         "options_message": {}
       },
       "id": "c4bfc814-0ba9-49db-9481-9f0fd054cfe0",
@@ -932,7 +932,7 @@
         "resource": "messages-api",
         "instanceName": "Erika",
         "remoteJid": "=573234062106@s.whatsapp.net",
-        "messageText": "=🙋 *UnicaU: un estudiante pide hablar con una persona*\n\n*Nombre:* {{ $json.nombre_perfil || 'sin nombre' }}\n*WhatsApp:* +{{ $json.telefono }}\n*Motivo:* {{ $json.motivo || 'no indicado' }}\n*Último mensaje:* {{ $json.ultimo_mensaje }}\n\nSi le escribes desde el número de UnicaU, el bot se pausa en ese chat. Para devolverle el control escribe ACTIVAR BOT en ese mismo chat.​",
+        "messageText": "=🙋 *AVSI: un estudiante pide hablar con una persona*\n\n*Nombre:* {{ $json.nombre_perfil || 'sin nombre' }}\n*WhatsApp:* +{{ $json.telefono }}\n*Motivo:* {{ $json.motivo || 'no indicado' }}\n*Último mensaje:* {{ $json.ultimo_mensaje }}\n\nSi le escribes desde el número de AVSI, el bot se pausa en ese chat. Para devolverle el control escribe ACTIVAR BOT en ese mismo chat.​",
         "options_message": {}
       },
       "id": "f1df3f13-f5ad-4887-855a-f7becb6eae42",
@@ -1792,7 +1792,7 @@
         "resource": "messages-api",
         "instanceName": "Erika",
         "remoteJid": "=573234062106@s.whatsapp.net",
-        "messageText": "=🧾 *Comprobante recibido · {{ $json.id }}*\n\n*Nombre:* {{ $json.nombre }}\n*Código:* {{ $json.codigo }} · *Documento:* {{ $json.numero_documento }}\n*Servicio:* {{ $json.servicio }}\n*Archivo:* {{ $json.tipo_archivo }}{{ $json.reenvio ? ' (lo envió de nuevo)' : '' }}\n*WhatsApp:* +{{ $json.telefono }}\n\nEl archivo está en el chat de UnicaU con este estudiante. Después de revisarlo, en la hoja Solicitudes cambia estado_pago a PAGO_VALIDADO o a COMPROBANTE_RECHAZADO (y escribe el motivo en observaciones).​",
+        "messageText": "=🧾 *Comprobante recibido · {{ $json.id }}*\n\n*Nombre:* {{ $json.nombre }}\n*Código:* {{ $json.codigo }} · *Documento:* {{ $json.numero_documento }}\n*Servicio:* {{ $json.servicio }}\n*Archivo:* {{ $json.tipo_archivo }}{{ $json.reenvio ? ' (lo envió de nuevo)' : '' }}\n*WhatsApp:* +{{ $json.telefono }}\n\nEl archivo está en el chat de AVSI con este estudiante. Después de revisarlo, en la hoja Solicitudes cambia estado_pago a PAGO_VALIDADO o a COMPROBANTE_RECHAZADO (y escribe el motivo en observaciones).​",
         "options_message": {}
       },
       "id": "e9905411-b381-4a98-8f5e-d7218cc01bc3",
@@ -1953,7 +1953,7 @@
             "campo": "estado",
             "valor_anterior": "",
             "valor_nuevo": "={{ $('Decidir registro').item.json.estado }}",
-            "actor": "UnicaU (bot)",
+            "actor": "AVSI (bot)",
             "origen": "WhatsApp",
             "detalle": "=Solicitud creada · horario_verificado={{ $('Decidir registro').item.json.horario_verificado }} · requiere_pago={{ $('Decidir registro').item.json.requiere_pago }} · estado_pago={{ $('Decidir registro').item.json.estado_pago }}"
           },
@@ -2076,7 +2076,7 @@
             "campo": "estado",
             "valor_anterior": "={{ $('Validar cancelación').item.json.estado }}",
             "valor_nuevo": "CANCELACION_SOLICITADA",
-            "actor": "UnicaU (bot)",
+            "actor": "AVSI (bot)",
             "origen": "WhatsApp",
             "detalle": "=Motivo dado por el estudiante: {{ $('Entrada herramienta').first().json.motivo }}"
           },
@@ -2199,7 +2199,7 @@
             "campo": "estado_pago",
             "valor_anterior": "={{ $('Elegir solicitud del pago').item.json.estado_pago_anterior }}",
             "valor_nuevo": "COMPROBANTE_RECIBIDO",
-            "actor": "UnicaU (bot)",
+            "actor": "AVSI (bot)",
             "origen": "WhatsApp",
             "detalle": "=Comprobante {{ $('Elegir solicitud del pago').item.json.tipo_archivo }} · mensaje {{ $('Elegir solicitud del pago').item.json.message_id }}"
           },

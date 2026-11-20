@@ -67,6 +67,7 @@ pestaña `Config` deben existir al menos:
 |---|---|
 | `solicitudes_id` | ID de la hoja de "Solicitudes" del mes vigente |
 | `carpeta_raiz_id` | ID de la carpeta raíz de agendas en Drive |
+| `telefono_encargada` | WhatsApp de la encargada (formato internacional sin `+`) |
 
 Un Apps Script rota `solicitudes_id` cada mes.
 

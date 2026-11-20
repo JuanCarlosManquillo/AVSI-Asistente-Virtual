@@ -1,9 +1,13 @@
-# UnicaU · Asistente Virtual de Salud Integral
+# AVSI · Asistente Virtual de Salud Integral
 
-Asistente conversacional por **WhatsApp** para el área de **Salud Integral** de la
-Universidad del Cauca. Permite a los estudiantes pedir, consultar y cancelar citas
-de **psicología, medicina y odontología**, con apoyo de IA, y automatiza las
-confirmaciones, recordatorios y la gestión de pagos.
+**AVSI** (Asistente Virtual de Salud Integral) es un asistente conversacional por
+**WhatsApp** para el área de **Salud Integral** de la Universidad del Cauca. Permite
+a los estudiantes pedir, consultar y cancelar citas de **psicología, medicina y
+odontología**, con apoyo de IA, y automatiza las confirmaciones, recordatorios y la
+gestión de pagos.
+
+> Antes llamado *UnicaU*. El proyecto pasó a llamarse **AVSI** y el repositorio es
+> [`AVSI-Asistente-Virtual`](https://github.com/JuanCarlosManquillo/AVSI-Asistente-Virtual).
 
 Construido con [n8n](https://n8n.io) (automatización), [Evolution API](https://doc.evolution-api.com)
 (WhatsApp), OpenAI (triage + agente conversacional) y Google Sheets / Drive como fuente de datos.
@@ -73,7 +77,10 @@ Cada flujo está documentado en [`docs/flujos/`](docs/flujos/).
 
 ## Instalación
 
-1. Clona el repositorio.
+1. Clona el repositorio:
+   ```bash
+   git clone https://github.com/JuanCarlosManquillo/AVSI-Asistente-Virtual.git
+   ```
 2. Importa los 3 flujos de [`workflows/`](workflows/) en tu instancia de n8n
    (ver [docs/importacion-n8n.md](docs/importacion-n8n.md)).
 3. Crea las credenciales en n8n (Google, Evolution, OpenAI) y vincúlalas a los nodos.

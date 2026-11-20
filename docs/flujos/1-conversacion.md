@@ -21,7 +21,7 @@ Webhook `POST /webhook/unicau` alimentado por Evolution API.
    (posible comprobante de pago → va al sub-workflow).
 4. **Triage**: un LLM barato (`gpt-4o-mini`, temperatura 0) clasifica intención y
    detecta **señal de riesgo** (autolesión/suicidio/emergencia).
-5. **Agente UnicaU**: agente conversacional con memoria por teléfono y 5 herramientas
+5. **Agente AVSI**: agente conversacional con memoria por teléfono y 5 herramientas
    (`consultar_mis_solicitudes`, `consultar_horarios`, `registrar_solicitud`,
    `solicitar_cancelacion`, `escalar_a_humano`).
 6. **Red de seguridad**: convierte Markdown a formato WhatsApp y garantiza que los
